@@ -165,9 +165,11 @@ def main():
         # MI325 256G 显存极大，不需要太吝啬，给 vLLM 0.4 足够了，剩下的给训练
         "actor_rollout_ref.rollout.gpu_memory_utilization=0.4", 
         "actor_rollout_ref.rollout.enforce_eager=True",
-        # 0.5B 模型极小，单卡推理绰绰有余，TP=1 效率最高
         # 8 卡环境下，Verl 会自动开启 Data Parallel 推理 (8路并发)
         "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
+        # vLLM 参数调整，避免 Chunked Prefill 报错
+        "actor_rollout_ref.rollout.enable_chunked_prefill=False", # 关闭 chunked prefill
+        "actor_rollout_ref.rollout.max_num_batched_tokens=16384", # 增大 batched tokens
         
         # --- Actor (训练) 配置 ---
         # FSDP 训练
