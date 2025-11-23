@@ -150,6 +150,7 @@ def main():
         
         # Actor 训练配置
         "actor_rollout_ref.actor.ppo_mini_batch_size=64",
+        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16", # 需要显式设置 micro batch size
         "actor_rollout_ref.actor.use_kl_loss=True", # GRPO 使用 KL loss
         "actor_rollout_ref.actor.kl_loss_coef=0.001",
         
