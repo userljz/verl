@@ -1,10 +1,8 @@
 import os
-import re
 import sys
 import subprocess
 import datasets
 import pandas as pd
-import torch
 
 # 确保当前目录在sys.path中，以便导入verl
 sys.path.append(os.getcwd())
@@ -124,43 +122,51 @@ def main():
     
     # 3. 构造启动命令
     # 我们调用 verl.trainer.main_ppo 模块
+    # 注意：所有 config key 必须严格匹配 verl/trainer/config/ppo_trainer.yaml 中的结构
     cmd = [
         sys.executable, "-m", "verl.trainer.main_ppo",
         
-        # 算法配置：使用 GRPO
+        # --- 算法配置 ---
         "algorithm.adv_estimator=grpo",
         "algorithm.use_kl_in_reward=False", # GRPO 通常不把 KL 放在 reward 里
+        "algorithm.kl_ctrl.kl_coef=0.001",
         
-        # 数据路径
+        # --- 数据配置 ---
         f"data.train_files={train_file}",
         f"data.val_files={test_file}",
         "data.train_batch_size=128", # 全局 batch size
         "data.max_prompt_length=512",
         "data.max_response_length=512",
         
-        # 模型配置
+        # --- 模型配置 ---
         f"actor_rollout_ref.model.path={model_path}",
         "actor_rollout_ref.model.use_remove_padding=True",
         
-        # Rollout 配置 (GRPO 核心)
+        # --- Rollout (推理) 配置 ---
         "actor_rollout_ref.rollout.n=5", # 每个 prompt 采样 5 个回复
         "actor_rollout_ref.rollout.name=vllm", # 使用 vllm 进行推理
-        "actor_rollout_ref.rollout.gpu_memory_utilization=0.5", # 限制显存占用
-        "actor_rollout_ref.rollout.enforce_eager=True", # AMD 环境推荐开启，避免 CUDA Graph 可能的问题
+        "actor_rollout_ref.rollout.gpu_memory_utilization=0.5", # 限制 vLLM 显存占用
+        "actor_rollout_ref.rollout.enforce_eager=True", # AMD 环境推荐开启，避免 CUDA Graph 问题
         
-        # Actor 训练配置
+        # --- Actor (策略模型) 训练配置 ---
         "actor_rollout_ref.actor.ppo_mini_batch_size=64",
-        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16", # 需要显式设置 micro batch size
+        # FSDP 训练需要显式指定 micro batch size
+        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16",
         "actor_rollout_ref.actor.use_kl_loss=True", # GRPO 使用 KL loss
         "actor_rollout_ref.actor.kl_loss_coef=0.001",
         
-        # Trainer 配置
+        # --- Reference (参考模型) 配置 ---
+        # 关键修复：Reference Model 也需要显式指定 micro batch size，否则会报错
+        "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16",
+        "actor_rollout_ref.ref.fsdp_config.param_offload=True", #以此节省显存
+        
+        # --- Trainer 配置 ---
         "trainer.total_epochs=1", # 演示只跑 1 个 epoch
         "trainer.n_gpus_per_node=1", # 单卡
         "trainer.nnodes=1",
         "trainer.project_name=verl_grpo_minimal_example",
         "trainer.experiment_name=qwen_05b_math",
-        "trainer.logger=['console']", # 只输出到控制台，不使用 wandb
+        "trainer.logger=['console']", # 只输出到控制台
     ]
     
     print("\n" + "="*50)
@@ -170,13 +176,14 @@ def main():
     
     # 4. 执行训练
     try:
-        subprocess.run(cmd, check=True)
+        # 设置环境变量以确保稳定性
+        env = os.environ.copy()
+        env["HYDRA_FULL_ERROR"] = "1" # 显示完整错误栈
+        subprocess.run(cmd, check=True, env=env)
     except subprocess.CalledProcessError as e:
         print(f"\n训练过程中出错: {e}")
     except KeyboardInterrupt:
         print("\n训练被用户中断。")
 
 if __name__ == "__main__":
-    # 确保 verl 依赖已安装 (transformers, torch, vllm 等)
     main()
-
