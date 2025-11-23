@@ -123,7 +123,7 @@ def main():
 
     # 2. 指定基础模型路径
     # 我们使用 Qwen2.5-0.5B-Instruct 作为基座，它小巧但推理能力不错，适合演示
-    model_path = "Qwen/Qwen2.5-0.5B-Instruct"
+    model_path = "Qwen/Qwen3-4B-Instruct-2507"
     
     # 3. 构造启动命令
     # 我们通过调用 verl.trainer.main_ppo 模块来启动训练。
@@ -143,7 +143,7 @@ def main():
         # =================================================================
         f"data.train_files={train_file}",     # 训练数据路径
         f"data.val_files={test_file}",       # 验证数据路径
-        "data.train_batch_size=2048",         # 全局 Batch Size：每次更新参数时使用的数据量（Prompt数量）。越大越稳。
+        "data.train_batch_size=128",         # 全局 Batch Size：每次更新参数时使用的数据量（Prompt数量）。越大越稳。
         "data.max_prompt_length=8192",        # 最大输入长度（问题长度），设大一点防止截断
         "data.max_response_length=8192",      # 最大输出长度（思维链长度），GRPO 需要模型输出很长的思考过程
         
