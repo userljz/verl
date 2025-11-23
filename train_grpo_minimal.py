@@ -147,6 +147,8 @@ def main():
         "actor_rollout_ref.rollout.name=vllm", # 使用 vllm 进行推理
         "actor_rollout_ref.rollout.gpu_memory_utilization=0.5", # 限制 vLLM 显存占用
         "actor_rollout_ref.rollout.enforce_eager=True", # AMD 环境推荐开启，避免 CUDA Graph 问题
+        # 设置 tensor_model_parallel_size 为 1，因为我们是单卡运行
+        "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
         
         # --- Actor (策略模型) 训练配置 ---
         "actor_rollout_ref.actor.ppo_mini_batch_size=64",
