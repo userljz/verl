@@ -24,10 +24,17 @@ try:
 except ImportError:
     MindspeedEngineWithLMHead = None
 
+# [MODIFIED START] Safe import for AMD/ROCm environment compatibility
+# Original code only caught ImportError. We catch Exception because transformer_engine
+# on AMD might raise RuntimeError (No HIP GPUs available) during import.
 try:
     from .megatron import MegatronEngine, MegatronEngineWithLMHead
 
     __all__ += ["MegatronEngine", "MegatronEngineWithLMHead"]
-except ImportError:
+except Exception as e:
+    import logging
+    logger = logging.getLogger(__name__)
+    logger.warning(f"Failed to import MegatronEngine: {e}. If you are not using Megatron, please ignore this warning.")
     MegatronEngine = None
     MegatronEngineWithLMHead = None
+# [MODIFIED END]

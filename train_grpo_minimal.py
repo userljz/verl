@@ -146,6 +146,7 @@ def main():
         "actor_rollout_ref.rollout.n=5", # 每个 prompt 采样 5 个回复
         "actor_rollout_ref.rollout.name=vllm", # 使用 vllm 进行推理
         "actor_rollout_ref.rollout.gpu_memory_utilization=0.5", # 限制显存占用
+        "actor_rollout_ref.rollout.enforce_eager=True", # AMD 环境推荐开启，避免 CUDA Graph 可能的问题
         
         # Actor 训练配置
         "actor_rollout_ref.actor.ppo_mini_batch_size=64",
