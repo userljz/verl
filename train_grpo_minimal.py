@@ -4,20 +4,24 @@ import subprocess
 import datasets
 import pandas as pd
 
-# 确保当前目录在sys.path中，以便导入verl
+# 确保当前目录在sys.path中，以便导入verl库
 sys.path.append(os.getcwd())
 
 def extract_solution(solution_str):
-    """从OpenR1-Math数据中提取boxed答案。
-    OpenR1通常遵循DeepSeek R1格式，答案在 \\boxed{} 中。
+    """
+    从数据集中提取标准答案。
+    对于数学推理任务（如GSM8k, OpenR1-Math），模型通常会在 \boxed{} 中输出最终答案。
+    这个函数用于从 ground_truth 字符串中提取这个 boxed 内容，以便后续 Reward Function 进行匹配打分。
     """
     if not solution_str:
         return ""
     
+    # 寻找最后一个 \boxed{...} 的起始位置
     idx = solution_str.rfind("\\boxed")
     if idx < 0:
-        return solution_str
+        return solution_str # 如果找不到，直接返回原字符串作为答案
     
+    # 简单的括号匹配逻辑，提取 {} 内部的内容
     content = solution_str[idx:]
     if content.startswith("\\boxed{"):
         count = 0
@@ -34,7 +38,8 @@ def extract_solution(solution_str):
 
 def prepare_data(output_dir="data/openr1"):
     """
-    下载并预处理 OpenR1-Math-220k 完整数据集。
+    准备训练数据：下载、预处理并保存为 Parquet 格式。
+    Verl 框架要求数据格式为 Parquet，并且包含特定的字段结构（prompt, reward_model等）。
     """
     print(f"正在准备数据，目标目录: {output_dir}...")
     os.makedirs(output_dir, exist_ok=True)
@@ -43,81 +48,63 @@ def prepare_data(output_dir="data/openr1"):
     
     try:
         print(f"正在加载完整数据集: {dataset_name}")
-        # 加载完整数据集
+        # 使用 HuggingFace datasets 库加载数据
         dataset = datasets.load_dataset(dataset_name, split="train")
         print(f"成功加载 {len(dataset)} 条样本。")
     except Exception as e:
         print(f"加载数据集失败: {e}")
         return None, None
 
+    # 系统提示词：引导模型进行思维链（Chain-of-Thought）推理，并规范输出格式
     system_prompt = "Please reason step by step and put your final answer within \\boxed{}."
 
-    # 处理数据
-    processed_data = []
-    # 即使是全量数据，为了演示效率，我们这里也可以只取一部分，或者全量
-    # 考虑到 Qwen 0.5B 训练很快，我们取 20000 条做演示，让你能在一个小时内看到明显变化
-    # 如果你想跑全量 220k，注释掉下面这行切片即可
-    # dataset = dataset.select(range(20000)) 
-    
+    # 开始数据预处理
     print(f"开始处理 {len(dataset)} 条数据...")
     
-    # 批量处理以提高速度
-    def process_batch(batch):
-        new_data = {
-            "data_source": [],
-            "prompt": [],
-            "ability": [],
-            "reward_model": [],
-            "extra_info": []
-        }
-        for prob, sol in zip(batch['problem'], batch['solution']): # OpenR1 字段名
-            ground_truth = extract_solution(sol)
-            prompt_messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": prob}
-            ]
-            new_data["data_source"].append("lighteval/MATH")
-            new_data["prompt"].append(prompt_messages)
-            new_data["ability"].append("math")
-            new_data["reward_model"].append({"style": "rule", "ground_truth": ground_truth})
-            new_data["extra_info"].append({"split": "train"})
-        return new_data
-
-    # 使用 map 进行并行处理 (如果数据量很大)
-    # 这里为了简单直接转 pandas
-    # 注意：OpenR1-Math-220k 数据字段可能是 'problem' 和 'solution' 或者 'question' 'response'
-    # 我们做一个简单的适配
-    data_list = []
+    processed_data = []
     for i, item in enumerate(dataset):
         if i % 10000 == 0:
             print(f"已处理 {i} 条...")
         
+        # 适配不同的数据集字段名
         q = item.get('problem', item.get('question'))
         a = item.get('solution', item.get('response'))
         
         if not q or not a: continue
 
+        # 构造符合 Verl 协议的数据结构
         processed_data.append({
-            "data_source": "lighteval/MATH",
+            # data_source 指定了使用哪个 Reward Function。
+            # 'lighteval/MATH' 对应 verl/utils/reward_score/math_reward.py，支持 latex 格式的数学公式匹配
+            "data_source": "lighteval/MATH", 
+            
+            # Prompt 必须是 Chat 格式的 list
             "prompt": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": q}
             ],
+            
             "ability": "math",
+            
+            # reward_model 字段包含用于计算奖励的真值（Ground Truth）
             "reward_model": {
                 "style": "rule", 
-                "ground_truth": extract_solution(a)
+                "ground_truth": extract_solution(a) # 提取出的标准答案
             },
+            
+            # 额外信息，用于调试或日志
             "extra_info": {"split": "train", "index": i}
         })
 
+    # 转换为 Pandas DataFrame
     df = pd.DataFrame(processed_data)
     
-    # 95% 训练，5% 验证
+    # 划分训练集和测试集 (95% 训练, 5% 验证)
     train_size = int(len(df) * 0.95)
     train_df = df.iloc[:train_size]
     test_df = df.iloc[train_size:]
     
+    # 保存为 Parquet 文件
     train_path = os.path.join(output_dir, "train.parquet")
     test_path = os.path.join(output_dir, "test.parquet")
     
@@ -134,71 +121,86 @@ def main():
         print("数据准备失败，退出")
         return
 
-    # 2. 设置训练参数
+    # 2. 指定基础模型路径
+    # 我们使用 Qwen2.5-0.5B-Instruct 作为基座，它小巧但推理能力不错，适合演示
     model_path = "Qwen/Qwen2.5-0.5B-Instruct"
     
     # 3. 构造启动命令
-    # 针对 8x MI325 (256GB) 的豪华配置
+    # 我们通过调用 verl.trainer.main_ppo 模块来启动训练。
+    # 所有的配置参数都通过 Hydra 格式传递（key=value）。
     cmd = [
         sys.executable, "-m", "verl.trainer.main_ppo",
         
-        # --- 算法核心 ---
-        "algorithm.adv_estimator=grpo",
-        "algorithm.use_kl_in_reward=False",
-        "algorithm.kl_ctrl.kl_coef=0.001",
+        # =================================================================
+        # 算法核心配置 (GRPO)
+        # =================================================================
+        "algorithm.adv_estimator=grpo",       # 指定使用 GRPO (Group Relative Policy Optimization) 算法
+        "algorithm.use_kl_in_reward=False",   # GRPO 特性：不把 KL 散度惩罚直接加在 Reward 里，而是作为 Loss 的一部分
+        "algorithm.kl_ctrl.kl_coef=0.001",    # KL 散度系数，防止模型偏离基座模型太远
         
-        # --- 数据配置 ---
-        f"data.train_files={train_file}",
-        f"data.val_files={test_file}",
-        "data.train_batch_size=2048", # 显存巨大，可以开超大 Batch Size 加速训练
-        "data.max_prompt_length=8192", # 增加上下文长度到 8192 (覆盖绝大多数数学题)
-        "data.max_response_length=8192", # 允许更长的思维链
+        # =================================================================
+        # 数据配置
+        # =================================================================
+        f"data.train_files={train_file}",     # 训练数据路径
+        f"data.val_files={test_file}",       # 验证数据路径
+        "data.train_batch_size=2048",         # 全局 Batch Size：每次更新参数时使用的数据量（Prompt数量）。越大越稳。
+        "data.max_prompt_length=8192",        # 最大输入长度（问题长度），设大一点防止截断
+        "data.max_response_length=8192",      # 最大输出长度（思维链长度），GRPO 需要模型输出很长的思考过程
         
-        # --- 模型配置 ---
-        f"actor_rollout_ref.model.path={model_path}",
-        "actor_rollout_ref.model.use_remove_padding=True",
+        # =================================================================
+        # 模型配置
+        # =================================================================
+        f"actor_rollout_ref.model.path={model_path}", # 模型路径
+        "actor_rollout_ref.model.use_remove_padding=True", # 开启去 Padding 优化，极大提升训练效率
         
-        # --- Rollout (推理) 配置 ---
-        # 采样数 N=16 (GRPO 推荐值，显存足够大可以更大，基线更稳)
-        "actor_rollout_ref.rollout.n=16", 
-        "actor_rollout_ref.rollout.name=vllm",
-        # MI325 256G 显存极大，不需要太吝啬，给 vLLM 0.4 足够了，剩下的给训练
-        "actor_rollout_ref.rollout.gpu_memory_utilization=0.4", 
-        "actor_rollout_ref.rollout.enforce_eager=True",
-        # 8 卡环境下，Verl 会自动开启 Data Parallel 推理 (8路并发)
-        "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
-        # vLLM 参数调整，避免 Chunked Prefill 报错
-        "actor_rollout_ref.rollout.enable_chunked_prefill=False", # 关闭 chunked prefill
-        "actor_rollout_ref.rollout.max_num_batched_tokens=16384", # 增大 batched tokens
+        # =================================================================
+        # Rollout (推理/生成) 配置
+        # GRPO 的核心在于：对于同一个问题，生成一组（Group）不同的回答
+        # =================================================================
+        "actor_rollout_ref.rollout.n=16",     # 关键参数：每个 Prompt 采样 16 个回答。GRPO 会对比这 16 个回答来计算优势。
+        "actor_rollout_ref.rollout.name=vllm",# 使用 vLLM 作为推理引擎，速度极快
+        "actor_rollout_ref.rollout.gpu_memory_utilization=0.4", # 限制 vLLM 占用 40% 显存，剩下的留给训练
+        "actor_rollout_ref.rollout.enforce_eager=True",         # AMD ROCm 环境特定优化：关闭 CUDA Graph 避免兼容性问题
         
-        # --- Actor (训练) 配置 ---
-        # FSDP 训练
-        "actor_rollout_ref.actor.ppo_mini_batch_size=512", # 增大 mini batch
-        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=64", # 256G 显存可以随便开
-        "actor_rollout_ref.actor.use_kl_loss=True",
-        "actor_rollout_ref.actor.kl_loss_coef=0.001",
-        # 显存足够，关闭 Offload 以获得极致速度
+        # 推理时的并行设置
+        "actor_rollout_ref.rollout.tensor_model_parallel_size=1", # 单个模型不做张量并行（0.5B太小了，不需要切分）
+        # vLLM 特定优化参数
+        "actor_rollout_ref.rollout.enable_chunked_prefill=False", # 关闭 Chunked Prefill 以避免上下文长度检查报错
+        "actor_rollout_ref.rollout.max_num_batched_tokens=16384", # 允许 vLLM 一次处理更多的 Token
+        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=64", # 计算生成文本 LogProb 时的 Batch Size
+        
+        # =================================================================
+        # Actor (策略模型) 训练配置
+        # 负责执行反向传播和参数更新
+        # =================================================================
+        "actor_rollout_ref.actor.ppo_mini_batch_size=512",        # PPO 更新时的 Mini Batch。显存大可以开大，加速训练。
+        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=64",# 每张卡每次前向传播处理的数据量（梯度累积）
+        "actor_rollout_ref.actor.use_kl_loss=True",               # 开启 KL Loss 计算
+        "actor_rollout_ref.actor.kl_loss_coef=0.001",             # KL Loss 的权重
+        
+        # FSDP (Fully Sharded Data Parallel) 优化配置
+        # 因为显存足够大 (256GB)，我们关闭所有 Offload，让参数常驻显存，速度最快
         "actor_rollout_ref.actor.fsdp_config.param_offload=False",
         "actor_rollout_ref.actor.fsdp_config.optimizer_offload=False",
         
-        # --- Reference (参考模型) 配置 ---
+        # =================================================================
+        # Reference (参考模型) 配置
+        # 用于计算 KL 散度，确保新模型不“忘本”
+        # =================================================================
         "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=64",
-        # 同样关闭 Ref 模型的 Offload，让它常驻显存，计算 KL 散度飞快
-        "actor_rollout_ref.ref.fsdp_config.param_offload=False",
+        "actor_rollout_ref.ref.fsdp_config.param_offload=False",  # 同样关闭 Offload，计算 KL 飞快
         
-        # --- Rollout Log Prob 配置 ---
-        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=64",
-        
-        # --- Trainer 配置 ---
-        "trainer.total_epochs=3", # 跑 3 个 Epoch 观察效果
-        "trainer.n_gpus_per_node=8", # 满血 8 卡
-        "trainer.nnodes=1",
-        "trainer.project_name=verl_grpo_full_scale",
-        "trainer.experiment_name=qwen_05b_math_8gpu",
-        "trainer.logger=['console']",
-        # 每 10 个 step 验证一次，让你能频繁看到效果变化
-        "trainer.test_freq=10",
-        "trainer.save_freq=-1", # 不保存 checkpoint
+        # =================================================================
+        # Trainer (训练器) 全局配置
+        # =================================================================
+        "trainer.total_epochs=3",             # 训练 3 个 Epoch
+        "trainer.n_gpus_per_node=8",          # 使用 8 张 GPU
+        "trainer.nnodes=1",                   # 单机训练
+        "trainer.project_name=verl_grpo_full_scale", # Wandb 项目名
+        "trainer.experiment_name=qwen_05b_math_8gpu",# 实验名
+        "trainer.logger=['console']",         # 日志只输出到控制台
+        "trainer.test_freq=10",               # 每 10 个 Step 就在验证集上测一次，方便观察效果
+        "trainer.save_freq=-1",               # 不保存 Checkpoint (设为 -1)
     ]
     
     print("\n" + "="*50)
@@ -207,10 +209,14 @@ def main():
     print("="*50 + "\n")
     
     try:
+        # 复制当前环境变量
         env = os.environ.copy()
+        # 开启完整错误栈打印，方便调试
         env["HYDRA_FULL_ERROR"] = "1"
-        # AMD 环境通常需要设置这个，防止多进程死锁
+        # AMD 环境常见优化：禁用 NCCL P2P（有时会导致死锁），改用共享内存或 Ring 模式
         env["NCCL_P2P_DISABLE"] = "1" 
+        
+        # 执行训练命令
         subprocess.run(cmd, check=True, env=env)
     except subprocess.CalledProcessError as e:
         print(f"\n训练过程中出错: {e}")
