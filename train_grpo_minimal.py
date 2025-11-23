@@ -159,6 +159,10 @@ def main():
         # 关键修复：Reference Model 也需要显式指定 micro batch size，否则会报错
         "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=16",
         "actor_rollout_ref.ref.fsdp_config.param_offload=True", #以此节省显存
+
+        # --- Rollout log prob 配置 ---
+        # 即使我们可能不计算 rollout log probs，verl 的配置检查也会强制要求设置这个参数
+        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16",
         
         # --- Trainer 配置 ---
         "trainer.total_epochs=1", # 演示只跑 1 个 epoch
