@@ -151,8 +151,8 @@ def main():
         f"data.train_files={train_file}",
         f"data.val_files={test_file}",
         "data.train_batch_size=2048", # 显存巨大，可以开超大 Batch Size 加速训练
-        "data.max_prompt_length=2048", # 增加上下文长度
-        "data.max_response_length=2048", # 允许更长的思维链
+        "data.max_prompt_length=8192", # 增加上下文长度到 8192 (覆盖绝大多数数学题)
+        "data.max_response_length=8192", # 允许更长的思维链
         
         # --- 模型配置 ---
         f"actor_rollout_ref.model.path={model_path}",
