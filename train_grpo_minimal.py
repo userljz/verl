@@ -130,6 +130,7 @@ def main():
     ppo_mini_batch_size = 64
     rollout_n = 32
     offload = False
+    vllm_gpu_memory_utilization = 0.8 # 给 vLLM 分配 80% 显存，因为模型较小但 KV Cache 需求大
     
     # 3. 构造启动命令
     # 我们通过调用 verl.trainer.main_ppo 模块来启动训练。
@@ -165,7 +166,7 @@ def main():
         # =================================================================
         f"actor_rollout_ref.rollout.n={rollout_n}",     # 关键参数：每个 Prompt 采样 {rollout_n} 个回答。GRPO 会对比这 {rollout_n} 个回答来计算优势。
         "actor_rollout_ref.rollout.name=vllm",# 使用 vLLM 作为推理引擎，速度极快
-        "actor_rollout_ref.rollout.gpu_memory_utilization=0.4", # 限制 vLLM 占用 40% 显存，剩下的留给训练
+        f"actor_rollout_ref.rollout.gpu_memory_utilization={vllm_gpu_memory_utilization}", # 限制 vLLM 占用 80% 显存，剩下的留给训练
         "actor_rollout_ref.rollout.enforce_eager=True",         # AMD ROCm 环境特定优化：关闭 CUDA Graph 避免兼容性问题
         
         # 推理时的并行设置
