@@ -122,13 +122,12 @@ def main():
         return
 
     # 2. 指定基础模型路径
-    # 我们使用 Qwen2.5-0.5B-Instruct 作为基座，它小巧但推理能力不错，适合演示
     model_path = "Qwen/Qwen3-4B-Instruct-2507"
     
     # 关键超参数配置
     n_gpus = 8
-    train_batch_size = 256
-    ppo_mini_batch_size = 128
+    train_batch_size = 128
+    ppo_mini_batch_size = 64
     rollout_n = 32
     offload = False
     
