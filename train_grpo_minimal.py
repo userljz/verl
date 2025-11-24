@@ -128,9 +128,10 @@ def main():
     n_gpus = 8
     train_batch_size = 128
     ppo_mini_batch_size = 64
-    rollout_n = 32
+    micro_batch_size_per_gpu = 8
+    rollout_n = 16
     offload = False
-    vllm_gpu_memory_utilization = 0.8 # 给 vLLM 分配 80% 显存，因为模型较小但 KV Cache 需求大
+    vllm_gpu_memory_utilization = 0.6 # 给 vLLM 分配 80% 显存，因为模型较小但 KV Cache 需求大
     
     # 3. 构造启动命令
     # 我们通过调用 verl.trainer.main_ppo 模块来启动训练。
@@ -151,8 +152,8 @@ def main():
         f"data.train_files={train_file}",     # 训练数据路径
         f"data.val_files={test_file}",       # 验证数据路径
         f"data.train_batch_size={train_batch_size}",         # 全局 Batch Size：每次更新参数时使用的数据量（Prompt数量）。越大越稳。
-        "data.max_prompt_length=8192",        # 最大输入长度（问题长度），设大一点防止截断
-        "data.max_response_length=8192",      # 最大输出长度（思维链长度），GRPO 需要模型输出很长的思考过程
+        "data.max_prompt_length=4096",        # 最大输入长度（问题长度），设大一点防止截断
+        "data.max_response_length=4096",      # 最大输出长度（思维链长度），GRPO 需要模型输出很长的思考过程
         
         # =================================================================
         # 模型配置
@@ -174,14 +175,14 @@ def main():
         # vLLM 特定优化参数
         "actor_rollout_ref.rollout.enable_chunked_prefill=False", # 关闭 Chunked Prefill 以避免上下文长度检查报错
         "actor_rollout_ref.rollout.max_num_batched_tokens=16384", # 允许 vLLM 一次处理更多的 Token
-        "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=64", # 计算生成文本 LogProb 时的 Batch Size
+        f"actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu={micro_batch_size_per_gpu}", # 计算生成文本 LogProb 时的 Batch Size
         
         # =================================================================
         # Actor (策略模型) 训练配置
         # 负责执行反向传播和参数更新
         # =================================================================
         f"actor_rollout_ref.actor.ppo_mini_batch_size={ppo_mini_batch_size}",        # PPO 更新时的 Mini Batch。必须 <= train_batch_size ({train_batch_size})
-        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16",# 每张卡每次前向传播处理的数据量（梯度累积）
+        f"actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu={micro_batch_size_per_gpu}",# 每张卡每次前向传播处理的数据量（梯度累积）
         "actor_rollout_ref.actor.use_kl_loss=True",               # 开启 KL Loss 计算
         "actor_rollout_ref.actor.kl_loss_coef=0.001",             # KL Loss 的权重
         
@@ -194,7 +195,7 @@ def main():
         # Reference (参考模型) 配置
         # 用于计算 KL 散度，确保新模型不“忘本”
         # =================================================================
-        "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=64",
+        f"actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu={micro_batch_size_per_gpu}",
         f"actor_rollout_ref.ref.fsdp_config.param_offload={offload}",  # 同样关闭 Offload，计算 KL 飞快
         
         # =================================================================
