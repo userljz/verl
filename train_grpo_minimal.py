@@ -131,7 +131,7 @@ def main():
     micro_batch_size_per_gpu = 8
     rollout_n = 16
     offload = False
-    vllm_gpu_memory_utilization = 0.4 # 给 vLLM 分配 40% 显存，避免初始化 OOM
+    vllm_gpu_memory_utilization = 0.7 # 给 vLLM 分配 70% 显存，256G显存充足，8B模型训练占用极小，多给vLLM避免KV Cache不足
     
     # 3. 构造启动命令
     # 我们通过调用 verl.trainer.main_ppo 模块来启动训练。
