@@ -122,7 +122,7 @@ def main():
         return
 
     # 2. 指定基础模型路径
-    model_path = "Qwen/Qwen2.5-0.5B-Instruct"  # Qwen/Qwen2.5-0.5B-Instruct  Qwen/Qwen3-4B-Instruct-2507
+    model_path = "meta-llama/Llama-3.1-8B-Instruct"  # Qwen/Qwen2.5-0.5B-Instruct  Qwen/Qwen3-4B-Instruct-2507  meta-llama/Llama-3.1-8B-Instruct
     
     # 关键超参数配置
     n_gpus = 8
