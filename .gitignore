@@ -128,3 +128,4 @@ logs
 log
 outputs
 .history
+train_grpo_minimal.sh
