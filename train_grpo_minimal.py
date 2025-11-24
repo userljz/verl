@@ -143,7 +143,7 @@ def main():
         # =================================================================
         f"data.train_files={train_file}",     # 训练数据路径
         f"data.val_files={test_file}",       # 验证数据路径
-        "data.train_batch_size=128",         # 全局 Batch Size：每次更新参数时使用的数据量（Prompt数量）。越大越稳。
+        "data.train_batch_size=256",         # 全局 Batch Size：每次更新参数时使用的数据量（Prompt数量）。越大越稳。
         "data.max_prompt_length=8192",        # 最大输入长度（问题长度），设大一点防止截断
         "data.max_response_length=8192",      # 最大输出长度（思维链长度），GRPO 需要模型输出很长的思考过程
         
@@ -157,7 +157,7 @@ def main():
         # Rollout (推理/生成) 配置
         # GRPO 的核心在于：对于同一个问题，生成一组（Group）不同的回答
         # =================================================================
-        "actor_rollout_ref.rollout.n=16",     # 关键参数：每个 Prompt 采样 16 个回答。GRPO 会对比这 16 个回答来计算优势。
+        "actor_rollout_ref.rollout.n=32",     # 关键参数：每个 Prompt 采样 16 个回答。GRPO 会对比这 16 个回答来计算优势。
         "actor_rollout_ref.rollout.name=vllm",# 使用 vLLM 作为推理引擎，速度极快
         "actor_rollout_ref.rollout.gpu_memory_utilization=0.4", # 限制 vLLM 占用 40% 显存，剩下的留给训练
         "actor_rollout_ref.rollout.enforce_eager=True",         # AMD ROCm 环境特定优化：关闭 CUDA Graph 避免兼容性问题
@@ -173,8 +173,8 @@ def main():
         # Actor (策略模型) 训练配置
         # 负责执行反向传播和参数更新
         # =================================================================
-        "actor_rollout_ref.actor.ppo_mini_batch_size=512",        # PPO 更新时的 Mini Batch。显存大可以开大，加速训练。
-        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=64",# 每张卡每次前向传播处理的数据量（梯度累积）
+        "actor_rollout_ref.actor.ppo_mini_batch_size=128",        # PPO 更新时的 Mini Batch。必须 <= train_batch_size (128)
+        "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16",# 每张卡每次前向传播处理的数据量（梯度累积）
         "actor_rollout_ref.actor.use_kl_loss=True",               # 开启 KL Loss 计算
         "actor_rollout_ref.actor.kl_loss_coef=0.001",             # KL Loss 的权重
         
@@ -198,7 +198,7 @@ def main():
         "trainer.nnodes=1",                   # 单机训练
         "trainer.project_name=verl_grpo_full_scale", # Wandb 项目名
         "trainer.experiment_name=qwen_05b_math_8gpu",# 实验名
-        "trainer.logger=['console']",         # 日志只输出到控制台
+        "trainer.logger=['console','wandb']", # 日志输出到控制台和wandb
         "trainer.test_freq=10",               # 每 10 个 Step 就在验证集上测一次，方便观察效果
         "trainer.save_freq=-1",               # 不保存 Checkpoint (设为 -1)
     ]
