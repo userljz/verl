@@ -179,7 +179,7 @@ def main():
         "actor_rollout_ref.rollout.tensor_model_parallel_size=1", # 单个模型不做张量并行（0.5B太小了，不需要切分）
         # vLLM 特定优化参数
         "actor_rollout_ref.rollout.enable_chunked_prefill=False", # 关闭 Chunked Prefill 以避免上下文长度检查报错
-        "actor_rollout_ref.rollout.max_num_batched_tokens=16384", # 允许 vLLM 一次处理更多的 Token
+        "actor_rollout_ref.rollout.max_num_batched_tokens=8192", # 限制 vLLM 一次处理的 Token 数量，防止 KV Cache 溢出 (原 16384)
         f"actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu={micro_batch_size_per_gpu}", # 计算生成文本 LogProb 时的 Batch Size
         
         # =================================================================
