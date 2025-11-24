@@ -10,6 +10,8 @@
 **/wandb
 
 *_log*
+log/
+251124_llama3_8b
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

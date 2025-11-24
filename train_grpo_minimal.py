@@ -128,8 +128,8 @@ def main():
     n_gpus = 8
     train_batch_size = 64
     ppo_mini_batch_size = 32
-    micro_batch_size_per_gpu = 8
-    rollout_n = 16
+    micro_batch_size_per_gpu = 4
+    rollout_n = 8
     offload = False
     vllm_gpu_memory_utilization = 0.7 # 给 vLLM 分配 70% 显存，256G显存充足，8B模型训练占用极小，多给vLLM避免KV Cache不足
     
