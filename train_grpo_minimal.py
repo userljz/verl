@@ -196,8 +196,8 @@ def main():
         "trainer.total_epochs=3",             # 训练 3 个 Epoch
         "trainer.n_gpus_per_node=8",          # 使用 8 张 GPU
         "trainer.nnodes=1",                   # 单机训练
-        "trainer.project_name=verl_grpo_full_scale", # Wandb 项目名
-        "trainer.experiment_name=qwen_05b_math_8gpu",# 实验名
+        "trainer.project_name=verl_grpo_test", # Wandb 项目名
+        "trainer.experiment_name=qwen_4b_math_8gpu",# 实验名
         "trainer.logger=['console','wandb']", # 日志输出到控制台和wandb
         "trainer.test_freq=10",               # 每 10 个 Step 就在验证集上测一次，方便观察效果
         "trainer.save_freq=-1",               # 不保存 Checkpoint (设为 -1)
