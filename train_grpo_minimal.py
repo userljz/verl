@@ -122,7 +122,7 @@ def main():
         return
 
     # 2. 指定基础模型路径
-    model_path = "Qwen/Qwen3-4B-Instruct-2507"
+    model_path = "Qwen/Qwen2.5-0.5B-Instruct"  # Qwen/Qwen2.5-0.5B-Instruct  Qwen/Qwen3-4B-Instruct-2507
     
     # 关键超参数配置
     n_gpus = 8
@@ -171,7 +171,7 @@ def main():
         
         # 【新增】强制设置数据并行度为 8，确保 8 张卡都参与推理
         "actor_rollout_ref.rollout.data_parallel_size=8",
-        
+
         "actor_rollout_ref.rollout.enforce_eager=True",         # AMD ROCm 环境特定优化：关闭 CUDA Graph 避免兼容性问题
         
         # 推理时的并行设置
