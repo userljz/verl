@@ -126,8 +126,8 @@ def main():
     
     # 关键超参数配置
     n_gpus = 8
-    train_batch_size = 128
-    ppo_mini_batch_size = 64
+    train_batch_size = 64
+    ppo_mini_batch_size = 32
     micro_batch_size_per_gpu = 8
     rollout_n = 16
     offload = False
