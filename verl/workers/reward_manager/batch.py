@@ -72,6 +72,10 @@ class BatchRewardManager(AbstractRewardManager):
             solution_strs=responses_str,
             ground_truths=ground_truths,
             extra_infos=extras,
+            # Pass raw tensors for advanced reward functions (e.g. SPD Scorer)
+            prompt_ids=prompt_ids,
+            response_ids=response_ids,
+            attention_mask=attention_mask,
             **self.reward_kwargs,
         )
 
