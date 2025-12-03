@@ -89,20 +89,28 @@ class SPDRollout(BaseRollout):
         """
         # 1. 准备输入
         idx = prompts.batch['input_ids'] # [Batch, Seq_Len]
+        # 这里的 attention_mask 是 padding mask，是2D的 [Batch, Seq_Len]
         attention_mask = prompts.batch['attention_mask']
         batch_size = idx.shape[0]
         
         # 解析输入序列以获取 Draft 和 Target Tokens
-        # 用于计算 Match Mask
-        parsed_result = parse_input_sequence(idx, self.sep_token_id)
-        draft_tokens = parsed_result["draft_tokens"]
-        target_tokens = parsed_result["target_tokens"]
+        # 我们直接从 prompts.non_tensor_batch['extra_info'] 中获取这些信息
+        # 注意: extra_info 是一个 object array，每个元素是一个 dict
+        extra_infos = prompts.non_tensor_batch['extra_info']
         
-        if draft_tokens is None or target_tokens is None:
-            raise ValueError("draft_tokens or target_tokens is None")
-        else:
-            # 计算 Match Mask: [Batch, Draft_Len]
-            match_mask = (draft_tokens == target_tokens).to(self.device)
+        draft_tokens_list = [info['draft_tokens'] for info in extra_infos]
+        target_tokens_list = [info['target_tokens'] for info in extra_infos]
+        
+        # 转换为 Tensor
+        draft_tokens = torch.tensor(draft_tokens_list, device=self.device, dtype=torch.long)
+        target_tokens = torch.tensor(target_tokens_list, device=self.device, dtype=torch.long)
+        
+        # 获取位置索引
+        draft_start_idx = torch.tensor([info['draft_start_idx'] for info in extra_infos], device=self.device, dtype=torch.long)
+        draft_end_idx = torch.tensor([info['draft_end_idx'] for info in extra_infos], device=self.device, dtype=torch.long)
+        
+        # 计算 Match Mask: [Batch, Draft_Len]
+        match_mask = (draft_tokens == target_tokens).to(self.device)
         
         # 2. 模型前向传播
         # 传入解析出的 tokens 以应用 mask (Rollout 阶段必须应用 mask 以强制 accept)
@@ -110,11 +118,11 @@ class SPDRollout(BaseRollout):
         outputs = self.model(
             input_ids=idx.to(self.device),
             attention_mask=attention_mask.to(self.device),
-            draft_tokens=draft_tokens.to(self.device) if draft_tokens is not None else None,
-            target_tokens=target_tokens.to(self.device) if target_tokens is not None else None,
-            # 传入位置索引以提高效率 (可选)
-            draft_start_idx=parsed_result["draft_start_idx"].to(self.device),
-            draft_end_idx=parsed_result["draft_end_idx"].to(self.device),
+            draft_tokens=draft_tokens,
+            target_tokens=target_tokens,
+            # 传入位置索引以提高效率
+            draft_start_idx=draft_start_idx,
+            draft_end_idx=draft_end_idx,
         )
         
         # outputs["probs"]: [Batch, Draft_Len]
@@ -172,6 +180,7 @@ class SPDRollout(BaseRollout):
                 'log_probs': log_probs,                  # 对应的 log 概率
                 'response_mask': loss_mask_expanded      # 关键: 只对 Mismatch 位置计算 Loss
             },
+            non_tensor_batch=prompts.non_tensor_batch, # 透传非 Tensor 数据 (Extra Info)
             meta_info={'rollout_n': rollout_n}
         )
         

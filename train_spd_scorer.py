@@ -15,18 +15,57 @@ Speculative Decoding Scorer 训练脚本
 
 import os
 import sys
-import json
 import subprocess
 import logging
-from typing import Optional, Dict, List, Any, Tuple
+from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass, field
-import random
 
 import torch
 import pandas as pd
 
+from transformers import AutoTokenizer
+
 # 确保当前目录在 sys.path 中
 sys.path.insert(0, os.getcwd())
+
+# ==============================================================================
+# Monkey Patch: 注册 SPD Scorer 模型
+# ==============================================================================
+import verl.utils.model
+from spd_scorer import AutoModelForSPDScoring
+
+# 强制注入自定义的模型加载逻辑
+_original_create_huggingface_actor = verl.utils.model.create_huggingface_actor
+
+def _patched_create_huggingface_actor(model_name: str, override_config_kwargs=None, automodel_kwargs=None) -> torch.nn.Module:
+    """
+    Hook 后的 create_huggingface_actor 函数，拦截并加载 SPD Scorer
+    """
+    if override_config_kwargs is None:
+        override_config_kwargs = {}
+    if automodel_kwargs is None:
+        automodel_kwargs = {}
+        
+    logger.info(f"[Patch] Intercepting model loading for: {model_name}")
+    logger.info(f"[Patch] Loading AutoModelForSPDScoring...")
+        
+    # 获取 HF Config
+    module_config = verl.utils.model.get_huggingface_actor_config(
+        model_name, override_config_kwargs, trust_remote_code=automodel_kwargs.get("trust_remote_code", False)
+    )
+    
+    # 使用 SPD Scorer Factory 加载模型
+    # 注意: 这里会调用 ScoringActor 的初始化，内部可能会再次加载 Backbone
+    # 但由于 vLLM 和 HF 的缓存机制，或者单纯的多次加载，只要显存足够，是可以接受的
+    model = AutoModelForSPDScoring.from_config(module_config, **automodel_kwargs)
+    
+    return model
+
+# 应用 Patch: 替换 verl.utils.model 中的函数
+verl.utils.model.create_huggingface_actor = _patched_create_huggingface_actor
+logger.info("✅ 已应用 Monkey Patch: verl.utils.model.create_huggingface_actor -> AutoModelForSPDScoring")
+
+# ==============================================================================
 
 # 设置日志
 logging.basicConfig(
@@ -89,281 +128,175 @@ class SPDTrainingConfig:
 # ==============================================================================
 # 2. 数据准备
 # ==============================================================================
-
-def prepare_spd_training_data(
-    config: SPDTrainingConfig,
-    num_samples: int = 10000,
-    max_context_len: int = 512,
-    max_draft_len: int = 32,
-    seed: int = 42
-) -> Tuple[str, str]:
-    """
-    准备 SPD Scorer 的训练数据
-    
-    数据格式说明:
-        - 每个样本包含: Context, Draft Tokens, Target Tokens
-        - 训练目标: 学习哪些 Mismatch 的 Draft Token 应该被接受
-    
-    实际使用时，你应该从真实的 Speculative Decoding 场景中收集数据:
-        1. 使用 Draft Model 生成 draft tokens
-        2. 使用 Target Model 验证并生成 target tokens
-        3. 记录最终答案是否正确
-    
-    Args:
-        config: 训练配置
-        num_samples: 生成的样本数量
-        max_context_len: 最大上下文长度
-        max_draft_len: 最大 Draft 长度
-        seed: 随机种子
-    
-    Returns:
-        train_path, val_path: 训练和验证数据路径
-    """
-    logger.info(f"准备 SPD 训练数据，目标目录: {config.data_dir}")
-    os.makedirs(config.data_dir, exist_ok=True)
-    
-    random.seed(seed)
-    torch.manual_seed(seed)
-    
-    # 生成模拟数据
-    # 注意: 实际使用时，这里应该加载真实的 Speculative Decoding 数据
-    processed_data = []
-    
-    for i in range(num_samples):
-        if i % 1000 == 0:
-            logger.info(f"已生成 {i}/{num_samples} 条数据...")
-        
-        # 模拟数据生成
-        # 实际使用时，这些应该来自真实的 Draft/Target Model 输出
-        draft_len = random.randint(8, max_draft_len)
-        
-        # 模拟 Context (这里用占位符，实际应该是真实文本)
-        context_text = f"Context for sample {i}. " * random.randint(1, 5)
-        
-        # 模拟 Draft 和 Target tokens (用 token ID 表示)
-        # 实际使用时，这些应该是真实的 token IDs
-        draft_tokens = [random.randint(1000, 30000) for _ in range(draft_len)]
-        
-        # Target tokens: 与 Draft 有一定重合 (约 70% 相同)
-        target_tokens = []
-        for dt in draft_tokens:
-            if random.random() < 0.7:
-                target_tokens.append(dt)  # Match
-            else:
-                target_tokens.append(random.randint(1000, 30000))  # Mismatch
-        
-        # 模拟 Baseline 正确性 (Target Model 单独是否答对)
-        is_correct_baseline = random.random() < 0.6  # 约 60% 正确率
-        
-        # 模拟 Ground Truth (最终正确答案)
-        ground_truth = f"answer_{i % 100}"
-        
-        # 构造 verl 协议格式的数据
-        # 关键: prompt 构造为 [Context + SEP + Draft + SEP + Target + SEP]
-        sample = {
-            # data_source 用于指定 reward function
-            # 我们使用自定义的 "spd_scorer" data_source
-            "data_source": "spd_scorer",
-            
-            # Prompt: 使用 Chat 格式
-            # 实际输入会在 tokenize 后变成 [Context] + [SEP] + [Draft] + [SEP] + [Target] + [SEP]
-            "prompt": [
-                {
-                    "role": "system", 
-                    "content": "You are a scoring model for speculative decoding. "
-                               "Decide which draft tokens to accept."
-                },
-                {
-                    "role": "user",
-                    "content": json.dumps({
-                        "context": context_text,
-                        "draft_tokens": draft_tokens,
-                        "target_tokens": target_tokens,
-                    })
-                }
-            ],
-            
-            "ability": "spd_scoring",
-            
-            # reward_model 字段: 包含计算 reward 所需的所有信息
-            "reward_model": {
-                "style": "rule",
-                "ground_truth": ground_truth,
-                "draft_tokens": draft_tokens,
-                "target_tokens": target_tokens,
-                "is_correct_baseline": is_correct_baseline,
-                "draft_len": draft_len,
-                # 奖励参数
-                "alpha": config.reward_alpha,
-                "penalty_break": config.reward_penalty_break,
-                "reward_correct": config.reward_correct,
-                "reward_useless": config.reward_useless,
-            },
-            
-            # 额外信息
-            "extra_info": {
-                "split": "train",
-                "index": i,
-                "draft_len": draft_len,
-                "match_ratio": sum(1 for d, t in zip(draft_tokens, target_tokens) if d == t) / draft_len,
-                # 传递给 Reward Function 的关键信息
-                "draft_tokens": draft_tokens,
-                "target_tokens": target_tokens,
-                "is_correct_baseline": is_correct_baseline,
-                "alpha": config.reward_alpha,
-                "penalty_break": config.reward_penalty_break,
-                "reward_correct": config.reward_correct,
-                "reward_useless": config.reward_useless,
-                # 上下文和补全服务配置
-                "context_text": context_text,
-                "target_model_url": config.target_model_url,
-                "target_model_name": config.target_model_name,
-                "model_path": config.model_path,
-            }
-        }
-        
-        processed_data.append(sample)
-    
-    # 转换为 DataFrame
-    df = pd.DataFrame(processed_data)
-    
-    # 划分训练集和验证集 (95% 训练, 5% 验证)
-    train_size = int(len(df) * 0.95)
-    train_df = df.iloc[:train_size]
-    val_df = df.iloc[train_size:]
-    
-    # 保存为 Parquet 文件
-    train_path = os.path.join(config.data_dir, config.train_file)
-    val_path = os.path.join(config.data_dir, config.val_file)
-    
-    train_df.to_parquet(train_path)
-    val_df.to_parquet(val_path)
-    
-    logger.info(f"数据已保存: 训练集 {len(train_df)} 条, 验证集 {len(val_df)} 条")
-    logger.info(f"  - 训练集路径: {train_path}")
-    logger.info(f"  - 验证集路径: {val_path}")
-    
-    return train_path, val_path
-
-
 def prepare_spd_data_from_real_source(
     config: SPDTrainingConfig,
-    source_data_path: str,
-    tokenizer_path: Optional[str] = None
+    source_data_path: List[str],
 ) -> Tuple[str, str]:
     """
-    从真实数据源准备 SPD 训练数据
-    
-    期望的输入数据格式 (JSON/Parquet):
-    {
-        "context": "...",           # 上下文文本
-        "draft_response": "...",    # Draft Model 的输出
-        "target_response": "...",   # Target Model 的输出
-        "ground_truth": "...",      # 正确答案
-        "is_correct_baseline": bool # Target Model 是否答对
-    }
+    从真实数据源 (SPD生成数据 + Metadata) 准备 SPD 训练数据
     
     Args:
         config: 训练配置
-        source_data_path: 源数据路径
-        tokenizer_path: Tokenizer 路径 (用于 tokenize 文本)
-    
-    Returns:
-        train_path, val_path: 处理后的数据路径
+        source_data_path: 包含两个文件路径的列表 [spd_gen_data_file, metadata_file]
     """
-    logger.info(f"从真实数据源加载: {source_data_path}")
+    if len(source_data_path) != 2:
+        raise ValueError("source_data_path 必须是包含两个元素的列表: [spd_gen_data_file, metadata_file]")
     
-    # 加载 tokenizer
-    if tokenizer_path is None:
-        tokenizer_path = config.model_path
+    spd_gen_data_file = source_data_path[0]
+    meta_file = source_data_path[1]
+    logger.info(f"SPD Gen Data File: {spd_gen_data_file}")
+    logger.info(f"Metadata File: {meta_file}")
     
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
-    logger.info(f"Tokenizer 加载成功: {tokenizer_path}")
+    # 加载 Tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(config.model_path, trust_remote_code=True)
+    logger.info(f"Tokenizer 加载成功: {config.model_path}")
     
-    # 加载源数据
-    if source_data_path.endswith('.parquet'):
-        source_df = pd.read_parquet(source_data_path)
-    elif source_data_path.endswith('.json') or source_data_path.endswith('.jsonl'):
-        source_df = pd.read_json(source_data_path, lines=source_data_path.endswith('.jsonl'))
-    else:
-        raise ValueError(f"不支持的数据格式: {source_data_path}")
+    # 1. 加载 Metadata 到内存字典 (Index -> Data)
+    logger.info("加载 Metadata...")
+    meta_df = pd.read_json(meta_file, lines=True)
+    # index 字段即为 sample_idx
+    meta_dict = meta_df.set_index("index").to_dict(orient="index")
+    logger.info(f"Metadata 数据量: {len(meta_dict)}")
     
-    logger.info(f"加载了 {len(source_df)} 条源数据")
+    # 2. 遍历 SPD 生成数据并处理
+    logger.info("处理 SPD 生成数据...")
+    spd_gen_df = pd.read_json(spd_gen_data_file, lines=True)
+    logger.info(f"SPD 生成数据量: {len(spd_gen_df)}")
     
     os.makedirs(config.data_dir, exist_ok=True)
     processed_data = []
     
-    for idx, row in source_df.iterrows():
+    for idx, row in spd_gen_df.iterrows():
         if idx % 1000 == 0:
-            logger.info(f"处理进度: {idx}/{len(source_df)}")
+            logger.info(f"处理进度: {idx}/{len(spd_gen_df)}")
+            
+        sample_idx = row.get('sample_idx')
+        cut_idx = row.get('cut_idx')
         
-        # 提取字段
-        context = row.get('context', '')
-        draft_response = row.get('draft_response', '')
-        target_response = row.get('target_response', '')
-        ground_truth = row.get('ground_truth', '')
-        is_correct_baseline = row.get('is_correct_baseline', False)
-        
-        # Tokenize
-        draft_tokens = tokenizer.encode(draft_response, add_special_tokens=False)
-        target_tokens = tokenizer.encode(target_response, add_special_tokens=False)
-        
-        # 对齐长度 (取较短的)
-        min_len = min(len(draft_tokens), len(target_tokens))
-        draft_tokens = draft_tokens[:min_len]
-        target_tokens = target_tokens[:min_len]
-        
-        if min_len == 0:
+        # 查找 Metadata
+        if sample_idx not in meta_dict:
+            logger.warning(f"Sample {sample_idx} not found in metadata. Skipping.")
             continue
+            
+        meta = meta_dict[sample_idx]
         
+        problem = meta.get('problem')
+        ground_truth = meta.get('reference_answer')
+        is_correct_baseline = meta.get('is_correct')
+        
+        # 构造 Context IDs
+        # Step A: Base Chat (System + User)
+        base_messages = [
+            {
+                "role": "system",
+                "content": "Please reason step by step, and put your final answer within \\boxed{}.",
+            },
+            {
+                "role": "user",
+                "content": problem,
+            },
+        ]
+        
+        # apply_chat_template 返回 tensor if return_tensors='pt'
+        # 这里我们需要 list[int] 以便拼接
+        base_ids = tokenizer.apply_chat_template(
+            base_messages,
+            tokenize=True,
+            add_generation_prompt=True
+        )
+        
+        # Step B: Answer Prefix
+        full_answer_ids = meta.get('answer_ids')
+        answer_prefix_ids = full_answer_ids[:cut_idx]
+        
+        # Step C: Splice Context
+        context_ids = base_ids + answer_prefix_ids
+        
+        # 获取 Draft / Target IDs
+        draft_ids = row.get('draft_output_ids')
+        target_ids = row.get('target_output_ids')
+        
+        # 严格校验长度: 如果 Draft 和 Target 长度不一致，直接跳过
+        if len(draft_ids) != len(target_ids):
+            logger.warning(f"Sample {sample_idx} draft/target length mismatch ({len(draft_ids)} vs {len(target_ids)}). Skipping.")
+            continue
+        if len(draft_ids) == 0:
+            logger.warning(f"Sample {sample_idx} draft length is 0. Skipping.")
+            continue
+            
+        draft_len = len(draft_ids)
+        target_len = len(target_ids) # 应该等于 draft_len
+
+        # =================================================================
+        # 构造完整的 Input IDs (用于 Actor 输入)
+        # 结构: [Context] + [SEP] + [Draft] + [SEP] + [Target] + [SEP]
+        # =================================================================
+        
+        # 获取 SEP Token ID (Llama-3 eot_id)
+        sep_token_id = config.sep_token_id
+        
+        # 拼接
+        # 注意: 这里假设 draft_ids 和 target_ids 已经是 list[int]
+        full_input_ids = (
+            context_ids + 
+            [sep_token_id] + 
+            draft_ids + 
+            [sep_token_id] + 
+            target_ids[:-1] + 
+            [sep_token_id]
+        )
+        
+        # 计算关键位置索引 (用于后续 Mask 生成和逻辑处理)
+        # draft_start_idx: Draft Tokens 的起始位置 (包含前面的 SEP)
+        # 实际上在 list 索引中，draft_start_idx 指向的是 Draft 的第一个 Token
+        # context_len (包含 SEP) = len(context_ids) + 1
+        draft_start_idx = len(context_ids) + 1 
+        
+        # draft_end_idx: Draft Tokens 的结束位置 (不包含后面的 SEP)
+        draft_end_idx = draft_start_idx + draft_len
+        
+        # target_start_idx: Target Tokens 的起始位置
+        # 前面有: Context + SEP + Draft + SEP
+        target_start_idx = draft_end_idx + 1
+        
+        # target_end_idx: Target Tokens 的结束位置
+        target_end_idx = target_start_idx + target_len
+            
         # 构造样本
         sample = {
             "data_source": "spd_scorer",
-            "prompt": [
-                {
-                    "role": "system",
-                    "content": "You are a scoring model for speculative decoding."
-                },
-                {
-                    "role": "user",
-                    "content": json.dumps({
-                        "context": context,
-                        "draft_tokens": draft_tokens,
-                        "target_tokens": target_tokens,
-                    })
-                }
-            ],
+            
+            # (1) 为了兼容 verl Dataset 接口，这里放一个 dummy prompt (实际上我们的 rollout/model 应该直接读取 input_ids)
+            "prompt": "dummy_prompt", 
+            
+            # =====================================================
+            # 核心数据 (顶层字段，方便后续 Rollout/Training 直接读取)
+            # =====================================================
+            "input_ids": full_input_ids,    # [Context] + [SEP] + [Draft] + [SEP] + [Target] + [SEP]
+            
+            # =====================================================
+            # verl 兼容字段
+            # =====================================================
             "ability": "spd_scoring",
             "reward_model": {
                 "style": "rule",
+                # (2) 将 Ground Truth 放入 reward_model 字段，这是 verl 的惯例
                 "ground_truth": ground_truth,
-                "draft_tokens": draft_tokens,
-                "target_tokens": target_tokens,
-                "is_correct_baseline": is_correct_baseline,
-                "draft_len": min_len,
-                "alpha": config.reward_alpha,
-                "penalty_break": config.reward_penalty_break,
-                "reward_correct": config.reward_correct,
-                "reward_useless": config.reward_useless,
             },
             "extra_info": {
                 "split": "train",
                 "index": idx,
-                "draft_len": min_len,
-                # 传递给 Reward Function 的关键信息
-                "draft_tokens": draft_tokens,
-                "target_tokens": target_tokens,
+                "context_ids": context_ids,
+                "draft_tokens": draft_ids,
+                "target_tokens": target_ids[:-1],
+                "bonus_tokens": target_ids[-1:],
                 "is_correct_baseline": is_correct_baseline,
-                "alpha": config.reward_alpha,
-                "penalty_break": config.reward_penalty_break,
-                "reward_correct": config.reward_correct,
-                "reward_useless": config.reward_useless,
-                # 上下文和补全服务配置
-                "context_text": context,
-                "target_model_url": config.target_model_url,
-                "target_model_name": config.target_model_name,
-                "model_path": config.model_path,
+                "draft_len": draft_len,
+                # 位置信息 (Non-Tensor, 但可以在 Rollout 中转为 Tensor)
+                "draft_start_idx": draft_start_idx,
+                "draft_end_idx": draft_end_idx,
+                "target_start_idx": target_start_idx,
+                "target_end_idx": target_end_idx,
             }
         }
         processed_data.append(sample)
@@ -386,269 +319,7 @@ def prepare_spd_data_from_real_source(
 
 
 # ==============================================================================
-# 3. 自定义 Reward Function
-# ==============================================================================
-
-def register_spd_reward_function():
-    """
-    注册 SPD Scorer 的自定义 Reward Function 到 verl
-    
-    这个函数会在 verl 启动前被调用，确保 reward function 可用
-    """
-    
-    # 创建 reward function 文件
-    reward_fn_code = '''
-# -*- coding: utf-8 -*-
-"""
-SPD Scorer 自定义 Reward Function
-用于 verl 框架的 reward 计算
-
-奖励逻辑:
-    - 场景 A (加速成功): Baseline 对 & Hybrid 对 -> Reward = alpha * L
-    - 场景 B (破坏正确): Baseline 对 & Hybrid 错 -> Reward = penalty_break
-    - 场景 C (无用尝试): Baseline 错 & Hybrid 错 -> Reward = reward_useless
-    - 场景 D (纠正错误): Baseline 错 & Hybrid 对 -> Reward = reward_correct
-"""
-
-import json
-import logging
-from typing import Dict, Any, Optional
-
-logger = logging.getLogger(__name__)
-
-
-def compute_effective_length(accept_decisions: list) -> int:
-    """
-    计算有效接受长度 L
-    
-    定义: 从序列开头连续为 True/1 的长度
-    
-    Args:
-        accept_decisions: Accept/Reject 决策列表
-    
-    Returns:
-        L: 有效接受长度
-    """
-    L = 0
-    for decision in accept_decisions:
-        if decision:
-            L += 1
-        else:
-            break
-    return L
-
-
-def verify_hybrid_correctness(
-    draft_tokens: list,
-    target_tokens: list,
-    accept_decisions: list,
-    ground_truth: str
-) -> bool:
-    """
-    验证 Hybrid 生成结果的正确性
-    
-    Hybrid 生成逻辑:
-        - 接受的位置: 使用 Draft Token
-        - 拒绝的位置: 使用 Target Token
-    
-    简化实现: 
-        - 这里使用启发式规则判断正确性
-        - 实际使用时应该调用真正的验证函数
-    
-    Args:
-        draft_tokens: Draft token IDs
-        target_tokens: Target token IDs
-        accept_decisions: Accept/Reject 决策
-        ground_truth: 正确答案
-    
-    Returns:
-        is_correct: Hybrid 结果是否正确
-    """
-    # 计算有效接受长度
-    L = compute_effective_length(accept_decisions)
-    
-    # 构建 Hybrid 序列
-    # hybrid = draft[:L] + target[L:]
-    hybrid_tokens = draft_tokens[:L] + target_tokens[L:]
-    
-    # 简化的正确性判断:
-    # - 如果接受了太多 Mismatch，可能破坏正确性
-    # - 实际使用时应该解码并验证答案
-    
-    mismatch_accepted = 0
-    for i in range(min(L, len(draft_tokens))):
-        if i < len(target_tokens) and draft_tokens[i] != target_tokens[i]:
-            mismatch_accepted += 1
-    
-    # 启发式: 如果接受的 Mismatch 超过 50%，认为可能出错
-    # 这是一个简化的判断，实际应该用真正的验证函数
-    if L > 0 and mismatch_accepted / L > 0.5:
-        return False
-    
-    return True
-
-
-def compute_score(
-    solution_str: str,
-    ground_truth: str,
-    draft_tokens: list = None,
-    target_tokens: list = None,
-    is_correct_baseline: bool = False,
-    draft_len: int = 0,
-    alpha: float = 1.0,
-    penalty_break: float = -10.0,
-    reward_correct: float = 100.0,
-    reward_useless: float = 0.0,
-    **kwargs
-) -> float:
-    """
-    计算 SPD Scorer 的 Reward
-    
-    这是 verl 框架调用的主函数
-    
-    Args:
-        solution_str: 模型生成的 "响应" (在 SPD 场景中，这是 Accept/Reject 决策序列)
-        ground_truth: 正确答案
-        draft_tokens: Draft token IDs
-        target_tokens: Target token IDs
-        is_correct_baseline: Target Model 是否答对
-        draft_len: Draft 序列长度
-        alpha: 加速奖励系数
-        penalty_break: 破坏正确答案的惩罚
-        reward_correct: 纠正错误的奖励
-        reward_useless: 无用尝试的奖励
-    
-    Returns:
-        reward: 计算得到的奖励值
-    """
-    try:
-        # 解析模型的输出
-        # 在 SPD 场景中，模型输出应该是 Accept/Reject 决策
-        # 格式: "1 1 1 0 1 0 ..." 或 "[1, 1, 1, 0, 1, 0, ...]"
-        
-        if solution_str.startswith('['):
-            # JSON 列表格式
-            accept_decisions = json.loads(solution_str)
-        else:
-            # 空格分隔格式
-            parts = solution_str.strip().split()
-            accept_decisions = [int(p) > 0 for p in parts if p.isdigit()]
-        
-        # 如果解析失败，使用默认决策（全部接受）
-        if not accept_decisions:
-            accept_decisions = [True] * draft_len
-        
-        # 确保长度匹配
-        if len(accept_decisions) < draft_len:
-            accept_decisions.extend([False] * (draft_len - len(accept_decisions)))
-        accept_decisions = accept_decisions[:draft_len]
-        
-    except Exception as e:
-        logger.warning(f"解析 Accept/Reject 决策失败: {e}, 使用默认值")
-        accept_decisions = [True] * draft_len
-    
-    # 计算有效接受长度
-    L = compute_effective_length(accept_decisions)
-    
-    # 验证 Hybrid 正确性
-    is_correct_hybrid = verify_hybrid_correctness(
-        draft_tokens=draft_tokens or [],
-        target_tokens=target_tokens or [],
-        accept_decisions=accept_decisions,
-        ground_truth=ground_truth
-    )
-    
-    # 根据四场景计算奖励
-    if is_correct_baseline and is_correct_hybrid:
-        # 场景 A: 加速成功
-        reward = alpha * L
-        scenario = "A"
-    elif is_correct_baseline and not is_correct_hybrid:
-        # 场景 B: 破坏正确答案 (严厉惩罚)
-        reward = penalty_break
-        scenario = "B"
-    elif not is_correct_baseline and not is_correct_hybrid:
-        # 场景 C: 无用尝试
-        reward = reward_useless
-        scenario = "C"
-    else:  # not is_correct_baseline and is_correct_hybrid
-        # 场景 D: 纠正错误 (重奖)
-        reward = reward_correct
-        scenario = "D"
-    
-    # 返回结果
-    # verl 期望返回 float 或包含 'score' 的 dict
-    return {
-        "score": reward,
-        "effective_length": L,
-        "scenario": scenario,
-        "is_correct_hybrid": is_correct_hybrid,
-        "accept_ratio": sum(accept_decisions) / len(accept_decisions) if accept_decisions else 0,
-    }
-'''
-    
-    # 确保 reward_score 目录存在
-    reward_dir = os.path.join(os.getcwd(), "verl", "utils", "reward_score")
-    os.makedirs(reward_dir, exist_ok=True)
-    
-    # 写入 reward function 文件
-    reward_file = os.path.join(reward_dir, "spd_scorer_reward.py")
-    with open(reward_file, 'w', encoding='utf-8') as f:
-        f.write(reward_fn_code)
-    
-    logger.info(f"SPD Reward Function 已写入: {reward_file}")
-    
-    # 修改 __init__.py 以注册新的 reward function
-    init_file = os.path.join(reward_dir, "__init__.py")
-    
-    # 检查是否已经注册
-    if os.path.exists(init_file):
-        with open(init_file, 'r', encoding='utf-8') as f:
-            init_content = f.read()
-        
-        # 检查是否已经包含 spd_scorer
-        if 'spd_scorer' not in init_content:
-            # 找到合适的位置插入
-            # 在 default_compute_score 函数中添加 spd_scorer 的处理
-            
-            insert_code = '''
-    elif data_source == "spd_scorer":
-        from . import spd_scorer_reward
-        res = spd_scorer_reward.compute_score(
-            solution_str, 
-            ground_truth,
-            draft_tokens=extra_info.get('draft_tokens') if extra_info else None,
-            target_tokens=extra_info.get('target_tokens') if extra_info else None,
-            is_correct_baseline=extra_info.get('is_correct_baseline', False) if extra_info else False,
-            draft_len=extra_info.get('draft_len', 0) if extra_info else 0,
-            alpha=extra_info.get('alpha', 1.0) if extra_info else 1.0,
-            penalty_break=extra_info.get('penalty_break', -10.0) if extra_info else -10.0,
-            reward_correct=extra_info.get('reward_correct', 100.0) if extra_info else 100.0,
-            reward_useless=extra_info.get('reward_useless', 0.0) if extra_info else 0.0,
-        )
-'''
-            
-            # 在 "openai/gsm8k" 条件之前插入
-            if 'elif data_source == "openai/gsm8k"' in init_content:
-                init_content = init_content.replace(
-                    'if data_source == "openai/gsm8k"',
-                    f'if data_source == "spd_scorer":{insert_code[insert_code.find("from"):]}\n    elif data_source == "openai/gsm8k"'
-                )
-            else:
-                # 如果找不到，尝试在函数开头插入
-                logger.warning("无法自动注册 SPD reward function，请手动修改 verl/utils/reward_score/__init__.py")
-            
-            # 写回文件
-            with open(init_file, 'w', encoding='utf-8') as f:
-                f.write(init_content)
-            
-            logger.info("SPD Reward Function 已注册到 verl")
-    
-    return reward_file
-
-
-# ==============================================================================
-# 4. 训练主函数
+# 3. 训练主函数
 # ==============================================================================
 
 def build_training_command(config: SPDTrainingConfig, train_file: str, val_file: str) -> list:
@@ -680,6 +351,11 @@ def build_training_command(config: SPDTrainingConfig, train_file: str, val_file:
         # =================================================================
         f"data.train_files={train_file}",
         f"data.val_files={val_file}",
+        
+        # 使用自定义的 SPD Dataset
+        "data.custom_cls.path=verl.utils.dataset.spd_dataset",
+        "data.custom_cls.name=SPDRLHFDataset",
+        
         f"data.train_batch_size={config.train_batch_size}",
         "data.max_prompt_length=2048",         # 包含 Context + Draft + Target
         "data.max_response_length=256",        # 输出是 Accept/Reject 决策序列
@@ -745,17 +421,17 @@ def build_training_command(config: SPDTrainingConfig, train_file: str, val_file:
     return cmd
 
 
-def run_training(config: SPDTrainingConfig):
+def run_training(config: SPDTrainingConfig, source_data_path: List[str]):
     """
     运行 SPD Scorer 训练
     
     完整流程:
         1. 准备训练数据
-        2. 注册自定义 Reward Function
-        3. 构建并执行训练命令
+        2. 构建并执行训练命令
     
     Args:
         config: 训练配置
+        source_data_path: 包含两个文件路径的列表 [spd_gen_data_file, metadata_file]
     """
     logger.info("=" * 60)
     logger.info("SPD Scorer GRPO 训练")
@@ -763,14 +439,10 @@ def run_training(config: SPDTrainingConfig):
     
     # Step 1: 准备数据
     logger.info("\n[Step 1] 准备训练数据...")
-    train_file, val_file = prepare_spd_training_data(config)
+    train_file, val_file = prepare_spd_data_from_real_source(config, source_data_path)
     
-    # Step 2: 注册 Reward Function
-    logger.info("\n[Step 2] 注册自定义 Reward Function...")
-    register_spd_reward_function()
-    
-    # Step 3: 构建训练命令
-    logger.info("\n[Step 3] 构建训练命令...")
+    # Step 2: 构建训练命令
+    logger.info("\n[Step 2] 构建训练命令...")
     cmd = build_training_command(config, train_file, val_file)
     
     logger.info("\n训练命令:")
@@ -778,8 +450,8 @@ def run_training(config: SPDTrainingConfig):
     for arg in cmd[5:]:
         logger.info(f"    {arg} \\")
     
-    # Step 4: 执行训练
-    logger.info("\n[Step 4] 启动训练...")
+    # Step 3: 执行训练
+    logger.info("\n[Step 3] 启动训练...")
     logger.info("=" * 60)
     
     offload_status = "ON" if config.offload else "OFF"
@@ -788,7 +460,14 @@ def run_training(config: SPDTrainingConfig):
     logger.info("=" * 60)
     
     try:
-        env = os.environ.copy()
+        # 获取包含奖励配置的环境变量
+        env = _get_reward_config_env(config)
+        
+        # [NEW] 将模型配置也注入环境变量，供 spd_scorer.py 读取
+        env["SPD_MODEL_PATH"] = str(config.model_path)
+        env["SPD_LORA_RANK"] = str(config.lora_rank)
+        env["SPD_LORA_ALPHA"] = str(config.lora_alpha)
+        
         env["HYDRA_FULL_ERROR"] = "1"
         env["NCCL_P2P_DISABLE"] = "1"
         
@@ -801,8 +480,22 @@ def run_training(config: SPDTrainingConfig):
         logger.info("\n训练被用户中断。")
 
 
+def _get_reward_config_env(config: SPDTrainingConfig) -> Dict[str, str]:
+    """生成 Reward Function 所需的环境变量"""
+    env = os.environ.copy()
+    env["SPD_REWARD_ALPHA"] = str(config.reward_alpha)
+    env["SPD_REWARD_PENALTY_BREAK"] = str(config.reward_penalty_break)
+    env["SPD_REWARD_CORRECT"] = str(config.reward_correct)
+    env["SPD_REWARD_USELESS"] = str(config.reward_useless)
+    if config.target_model_url:
+        env["SPD_TARGET_MODEL_URL"] = str(config.target_model_url)
+    if config.target_model_name:
+        env["SPD_TARGET_MODEL_NAME"] = str(config.target_model_name)
+    return env
+
+
 # ==============================================================================
-# 5. 独立的 SPD Scorer 训练循环 (不依赖 verl 的 main_ppo)
+# 4. 独立的 SPD Scorer 训练循环 (不依赖 verl 的 main_ppo)
 # ==============================================================================
 
 def train_spd_scorer_standalone(config: SPDTrainingConfig):
@@ -887,7 +580,7 @@ def train_spd_scorer_standalone(config: SPDTrainingConfig):
 
 
 # ==============================================================================
-# 6. 命令行入口
+# 5. 命令行入口
 # ==============================================================================
 
 def main():
@@ -909,10 +602,10 @@ def main():
     # 数据配置
     parser.add_argument("--data_dir", type=str, default="data/spd_scorer",
                         help="数据目录")
-    parser.add_argument("--num_samples", type=int, default=10000,
-                        help="生成的模拟样本数量")
-    parser.add_argument("--source_data", type=str, default=None,
-                        help="真实数据源路径 (可选)")
+    parser.add_argument("--spd_gen_data_file", type=str, required=True,
+                        help="SPD 生成数据文件路径 (jsonl)")
+    parser.add_argument("--metadata_file", type=str, required=True,
+                        help="Metadata 文件路径 (jsonl)")
     
     # 训练配置
     parser.add_argument("--n_gpus", type=int, default=8, help="GPU 数量")
@@ -975,8 +668,10 @@ def main():
     logger.info("=" * 60 + "\n")
     
     # 根据模式选择训练方法
+    source_data_path = [args.spd_gen_data_file, args.metadata_file]
+    
     if args.mode == "verl":
-        run_training(config)
+        run_training(config, source_data_path)
     else:
         train_spd_scorer_standalone(config)
 

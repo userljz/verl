@@ -7,21 +7,44 @@ SPD Scorer 自定义 Reward Function (Tensor Batch Optimized)
     - 移除 async/aiohttp，改为同步的 Tensor 批处理 + 批量 API 调用
     - 移除 parse_accept_decisions，直接使用 Tensor 输入
     - 强制使用 Batch 模式，大幅提升 GPU 利用率和吞吐量
+    - 使用离线 vLLM (LLM.generate) 替代 HTTP API，支持单例缓存
+
+环境变量配置:
+    # ========== 必需 ==========
+    SPD_TARGET_MODEL_PATH       : Target Model 路径 (用于 vLLM 和 Tokenizer)
+    
+    # ========== Reward 计算参数 ==========
+    SPD_REWARD_ALPHA            : 线性奖励系数 (默认: 1.0)
+    SPD_REWARD_PENALTY_BREAK    : 中断惩罚 (默认: -10.0)
+    SPD_REWARD_CORRECT          : 意外答对奖励 (默认: 100.0)
+    SPD_REWARD_USELESS          : 无用惩罚 (默认: 0.0)
+    
+    # ========== vLLM 引擎配置 ==========
+    SPD_VLLM_TENSOR_PARALLEL_SIZE      : 张量并行大小 (默认: 1)
+    SPD_VLLM_GPU_MEMORY_UTILIZATION    : GPU 显存利用率 (默认: 0.9)
+    SPD_VLLM_MAX_MODEL_LEN             : 最大模型长度 (默认: 不限制)
+    
+    # ========== vLLM 生成参数 ==========
+    SPD_VLLM_TEMPERATURE        : 采样温度 (默认: 0.0)
+    SPD_VLLM_MAX_TOKENS         : 最大生成 token 数 (默认: 1024)
 
 作者: AI Assistant
 日期: 2025-11-26
 """
 
 import logging
-import requests
 import torch
 import numpy as np
+import os
 from typing import Dict, Any, Optional, List, Union
 
 logger = logging.getLogger(__name__)
 
-# 全局 Tokenizer 缓存
+# ============================================================================
+# 全局缓存 (单例模式)
+# ============================================================================
 _TOKENIZER_CACHE = {}
+_VLLM_ENGINE_CACHE = {}  # 缓存 vLLM LLM 实例
 
 def get_tokenizer(model_path: str):
     """获取或加载 Tokenizer"""
@@ -33,120 +56,141 @@ def get_tokenizer(model_path: str):
     _TOKENIZER_CACHE[model_path] = tokenizer
     return tokenizer
 
-def parse_input_sequence(input_ids, sep_token_id):
-    """
-    解析 input_ids (Context + Draft + Target)
-    复用 spd_scorer.py 中的逻辑
-    """
-    try:
-        from spd_scorer import parse_input_sequence as original_parse
-        return original_parse(input_ids, sep_token_id)
-    except ImportError:
-        logger.warning("Could not import parse_input_sequence from spd_scorer. Implementing fallback.")
-        # Fallback implementation (simplified)
-        batch_size = input_ids.shape[0]
-        device = input_ids.device
-        sep_positions = (input_ids == sep_token_id).nonzero(as_tuple=False)
-        result = {"draft_tokens": [], "context_ids": []}
-        
-        # We need draft tokens. Assuming 3 SEPs: Context|Draft|Target
-        # or 2 SEPs if Context|Draft+Target? Standard is 3.
-        for b in range(batch_size):
-            batch_seps = sep_positions[sep_positions[:, 0] == b, 1]
-            if len(batch_seps) >= 2:
-                # Context | Draft | Target
-                # 0...sep1...sep2...
-                sep1 = batch_seps[0].item()
-                sep2 = batch_seps[1].item()
-                draft = input_ids[b, sep1+1:sep2]
-                context = input_ids[b, :sep1]
-                
-                # Append to list (we will pad later or just use list of tensors)
-                result["draft_tokens"].append(draft)
-                result["context_ids"].append(context)
-            else:
-                 result["draft_tokens"].append(torch.tensor([], device=device))
-                 result["context_ids"].append(torch.tensor([], device=device))
-        return result
 
-def compute_effective_length_tensor(accept_decisions: torch.Tensor) -> torch.Tensor:
+def get_vllm_engine(
+    model_path: str,
+    tensor_parallel_size: int = 1,
+    gpu_memory_utilization: float = 0.9,
+    max_model_len: Optional[int] = None,
+    trust_remote_code: bool = True,
+    dtype: str = "auto",
+    **kwargs
+):
     """
-    计算有效接受长度 L (Tensor Version)
+    获取或初始化 vLLM LLM 实例 (单例模式)
     
     Args:
-        accept_decisions: [Batch, Draft_Len] (0/1)
+        model_path: 模型路径或 HuggingFace 模型名
+        tensor_parallel_size: 张量并行大小
+        gpu_memory_utilization: GPU 显存利用率
+        max_model_len: 最大模型长度
+        trust_remote_code: 是否信任远程代码
+        dtype: 数据类型
+        **kwargs: 其他 vLLM 参数
     
     Returns:
-        L: [Batch]
+        vLLM LLM 实例
     """
-    # 找到第一个 0 的位置
-    # 如果全为 1，则长度为 Draft_Len
-    # 如果有 0，则长度为第一个 0 的索引
+    # 使用 model_path 作为 cache key
+    cache_key = model_path
     
-    # create a mask for first zero
-    # cumprod: 1 1 1 0 0 -> 1 1 1 0 0
-    # sum: 3
+    if cache_key in _VLLM_ENGINE_CACHE:
+        logger.info(f"[vLLM] Reusing cached engine for: {model_path}")
+        return _VLLM_ENGINE_CACHE[cache_key]
     
-    # 注意: 如果中间有 0，后面的 1 也是无效的 (Speculative Decoding 性质)
-    # 所以 cumprod 是正确的逻辑: 一旦遇到 0，后面全变成 0
-    mask = torch.cumprod(accept_decisions, dim=1)
-    L = mask.sum(dim=1)
-    return L
+    logger.info(f"[vLLM] Initializing new engine for: {model_path}")
+    
+    from vllm import LLM
+    
+    llm = LLM(
+        model=model_path,
+        tensor_parallel_size=tensor_parallel_size,
+        gpu_memory_utilization=gpu_memory_utilization,
+        max_model_len=max_model_len,
+        trust_remote_code=trust_remote_code,
+        dtype=dtype,
+        **kwargs
+    )
+    
+    _VLLM_ENGINE_CACHE[cache_key] = llm
+    logger.info(f"[vLLM] Engine initialized and cached for: {model_path}")
+    
+    return llm
+
 
 def batch_vllm_generate(
-    prompts: List[List[int]],
-    api_url: str,
-    model: str,
+    prompt_token_ids: List[List[int]],
+    model_path: str,
     temperature: float = 0.0,
-    max_tokens: int = 1024
+    max_tokens: int = 1024,
+    top_p: float = 1.0,
+    # vLLM 引擎配置参数
+    tensor_parallel_size: int = 1,
+    gpu_memory_utilization: float = 0.9,
+    max_model_len: Optional[int] = None,
+    **engine_kwargs
 ) -> List[str]:
     """
-    调用 vLLM 批量接口 (发送 Token IDs)
+    使用离线 vLLM 批量生成 (直接传入 Token IDs)
+    
+    Args:
+        prompt_token_ids: 批量 prompt token ids, List[List[int]]
+        model_path: 模型路径
+        temperature: 采样温度
+        max_tokens: 最大生成 token 数
+        top_p: nucleus sampling 参数
+        tensor_parallel_size: 张量并行大小 (首次初始化时使用)
+        gpu_memory_utilization: GPU 显存利用率 (首次初始化时使用)
+        max_model_len: 最大模型长度 (首次初始化时使用)
+        **engine_kwargs: 其他 vLLM 引擎参数
+    
+    Returns:
+        生成的文本列表
     """
-    if not prompts:
+    if not prompt_token_ids:
         return []
-
-    headers = {"Content-Type": "application/json"}
     
-    # vLLM 支持 batch prompt_token_ids
-    data = {
-        "model": model,
-        "prompt_token_ids": prompts, # 传递 Token IDs 列表
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "top_p": 1.0,
-    }
+    from vllm import SamplingParams
     
-    try:
-        response = requests.post(api_url, headers=headers, json=data, timeout=60)
-        response.raise_for_status()
-        result = response.json()
-        # 提取结果文本
-        return [choice['text'] for item in result['choices'] for choice in [item]] # 假设 choices 结构匹配
-        # vLLM OpenAI API 结构: choices 是一个列表，对应 batch 中的每一个
-        # 但是标准的 OpenAI /completions 接口对于 batch 输入，choices 长度 = batch_size
-        if 'choices' in result:
-             return [c['text'] for c in result['choices']]
-    except Exception as e:
-        logger.error(f"vLLM Batch Request Error: {e}")
-        # 失败时返回空字符串列表，后续逻辑需处理
-        return [""] * len(prompts)
+    # 获取或初始化 vLLM 引擎 (单例)
+    llm = get_vllm_engine(
+        model_path=model_path,
+        tensor_parallel_size=tensor_parallel_size,
+        gpu_memory_utilization=gpu_memory_utilization,
+        max_model_len=max_model_len,
+        **engine_kwargs
+    )
+    
+    # 构造采样参数
+    sampling_params = SamplingParams(
+        temperature=temperature,
+        top_p=top_p,
+        max_tokens=max_tokens,
+    )
+    
+    # 批量生成 - 直接传入 token ids
+    outputs = llm.generate(
+        prompt_token_ids=prompt_token_ids,
+        sampling_params=sampling_params,
+    )
+    
+    # 提取生成的文本
+    results = []
+    for output in outputs:
+        # output.outputs[0] 是第一个生成结果 (因为 n=1)
+        generated_text = output.outputs[0].text
+        results.append(generated_text)
+    
+    return results
+        
+    
 
 
-def compute_score_batch(
+def compute_score(
     solution_strs: List[str],
     ground_truths: List[str],
     extra_infos: List[Dict[str, Any]],
     prompt_ids: Optional[torch.Tensor] = None,   # [Batch, Seq_Len]
     response_ids: Optional[torch.Tensor] = None, # [Batch, Response_Len] (即 Accept Decisions)
     attention_mask: Optional[torch.Tensor] = None,
-    alpha: float = 1.0,
-    penalty_break: float = -10.0,
-    reward_correct: float = 100.0,
-    reward_useless: float = 0.0,
-    target_model_url: Optional[str] = None,
-    target_model_name: Optional[str] = None,
+    # Reward 计算参数
+    alpha: Optional[float] = None,
+    penalty_break: Optional[float] = None,
+    reward_correct: Optional[float] = None,
+    reward_useless: Optional[float] = None,
+    # vLLM 模型配置
     model_path: Optional[str] = None,
+    # 其他参数 (包括 vLLM 引擎配置: tensor_parallel_size, gpu_memory_utilization, max_model_len 等)
     **kwargs
 ) -> List[Union[float, Dict[str, Any]]]:
     """
@@ -162,23 +206,47 @@ def compute_score_batch(
     完全向量化实现，移除 Python 循环。
     """
     
+    # 从环境变量读取默认配置 (如果未通过参数传入)
+    if alpha is None:
+        alpha = float(os.getenv("SPD_REWARD_ALPHA", "1.0"))
+    if penalty_break is None:
+        penalty_break = float(os.getenv("SPD_REWARD_PENALTY_BREAK", "-10.0"))
+    if reward_correct is None:
+        reward_correct = float(os.getenv("SPD_REWARD_CORRECT", "100.0"))
+    if reward_useless is None:
+        reward_useless = float(os.getenv("SPD_REWARD_USELESS", "0.0"))
+    
+    # model_path 也可以从环境变量读取
+    if model_path is None:
+        model_path = os.getenv("SPD_TARGET_MODEL_PATH")
+
     # -------------------------------------------------------------------------
     # 0. 数据校验 (Strict Mode)
     # -------------------------------------------------------------------------
     if response_ids is None or prompt_ids is None:
         raise ValueError("compute_score_batch: 'response_ids' and 'prompt_ids' tensors are REQUIRED.")
 
-    batch_size = len(solution_strs)
+    batch_size = prompt_ids.shape[0]
     
-    # 确保配置存在
-    t_url = target_model_url or extra_infos[0].get("target_model_url")
-    m_path = model_path or extra_infos[0].get("model_path")
-    
-    if not t_url or not m_path:
-        raise ValueError("Missing configuration: 'target_model_url' or 'model_path' must be provided.")
+    # -------------------------------------------------------------------------
+    # 从环境变量读取 vLLM 配置
+    # -------------------------------------------------------------------------
+    m_path = model_path or os.getenv("SPD_TARGET_MODEL_PATH")
+    if not m_path:
+        raise ValueError("Missing 'model_path'. Set SPD_TARGET_MODEL_PATH env var or pass model_path parameter.")
 
     tokenizer = get_tokenizer(m_path)
-    t_name = target_model_name or extra_infos[0].get("target_model_name") or "target-model"
+    
+    # vLLM 引擎配置 (全部从环境变量读取)
+    _tp_size = os.getenv("SPD_VLLM_TENSOR_PARALLEL_SIZE", "1")
+    _gpu_util = os.getenv("SPD_VLLM_GPU_MEMORY_UTILIZATION", "0.9")
+    _max_len = os.getenv("SPD_VLLM_MAX_MODEL_LEN", "")
+    
+    vllm_config = {
+        "tensor_parallel_size": int(_tp_size),
+        "gpu_memory_utilization": float(_gpu_util),
+        "max_model_len": int(_max_len) if _max_len else None,
+    }
 
     # -------------------------------------------------------------------------
     # 1. 计算有效长度 L (Tensor Parallel)
@@ -191,54 +259,48 @@ def compute_score_batch(
     # -------------------------------------------------------------------------
     # 2. 构造 vLLM Prompts & Baseline Correctness
     # -------------------------------------------------------------------------
-    sep_token_id = kwargs.get("sep_token_id", 128009)
-    parsed_batch = parse_input_sequence(prompt_ids, sep_token_id)
+    # 直接从 extra_infos 提取数据，不再 Parse prompt_ids
     
-    # Check parsing
-    if not parsed_batch.get("draft_tokens") or not parsed_batch.get("context_ids"):
-        raise ValueError(f"Failed to parse tokens using SEP={sep_token_id}")
+    context_ids_list = []
+    draft_tokens_list = []
+    is_correct_baseline_list = []
+    target_tokens_list = []
+    bonus_tokens_list = []
+    
+    for info in extra_infos:
+        # Context IDs (List[int])
+        c_ids = info.get("context_ids")
+        if c_ids is None:
+            raise ValueError("Missing 'context_ids' in extra_info")
+        context_ids_list.append(c_ids)
+        
+        # Draft Tokens (List[int])
+        d_tokens = info.get("draft_tokens")
+        if d_tokens is None:
+            raise ValueError("Missing 'draft_tokens' in extra_info")
+        draft_tokens_list.append(d_tokens)
 
-    # 批量提取数据
-    # spd_scorer.py updated parse_input_sequence returns padded tensors
-    
-    if "context_ids" in parsed_batch and isinstance(parsed_batch["context_ids"], torch.Tensor):
-        # context_ids is Padded Tensor [Batch, MaxCtx]. Need to strip padding.
-        # Use context_end_idx to slice
-        c_end_idxs = parsed_batch["context_end_idx"].tolist()
-        context_ids_padded = parsed_batch["context_ids"]
-        context_ids_list = [context_ids_padded[i, :end].tolist() for i, end in enumerate(c_end_idxs)]
-    elif "context_ids" in parsed_batch:
-         # List of tensors/lists fallback
-         context_ids_list = [c.tolist() if isinstance(c, torch.Tensor) else c for c in parsed_batch["context_ids"]]
-    else:
-        raise ValueError("parsed_batch missing context_ids")
+        target_tokens = info.get("target_tokens")
+        if target_tokens is None:
+            raise ValueError("Missing 'target_tokens' in extra_info")
+        target_tokens_list.append(target_tokens)
 
-    if "draft_tokens" in parsed_batch and isinstance(parsed_batch["draft_tokens"], torch.Tensor):
-        # draft_tokens is Padded Tensor [Batch, MaxDraft].
-        # We don't need to strip padding explicitly here because we slice with [:l_val] later.
-        # But l_val depends on response_ids which matches draft length.
-        # However, for robustness, we convert rows to lists.
-        # Note: These lists will have trailing zeros.
-        # But since we do `draft_tokens_list[i][:l_val]`, and `l_val` <= actual draft length,
-        # the trailing zeros are never accessed. So it is safe.
-        draft_tokens_list = parsed_batch["draft_tokens"].tolist()
-    elif "draft_tokens" in parsed_batch:
-         draft_tokens_list = [d.tolist() if isinstance(d, torch.Tensor) else d for d in parsed_batch["draft_tokens"]]
-    else:
-        raise ValueError("parsed_batch missing draft_tokens")
-    
-    # 提取 is_correct_baseline
-    # 假设 extra_infos 是 list of dicts. 如果没有 is_correct_baseline 则报错
-    is_correct_baseline_list = [info.get("is_correct_baseline") for info in extra_infos]
-    if None in is_correct_baseline_list:
-         raise ValueError("Missing 'is_correct_baseline' in extra_info")
+        bonus_tokens = info.get("bonus_tokens")
+        if bonus_tokens is None:
+            raise ValueError("Missing 'bonus_tokens' in extra_info")
+        bonus_tokens_list.append(bonus_tokens)
+        
+        # Baseline Correctness
+        is_correct = info.get("is_correct_baseline")
+        if is_correct is None:
+            raise ValueError("Missing 'is_correct_baseline' in extra_info")
+        is_correct_baseline_list.append(is_correct)
     
     # 转为 Tensor 以便后续计算
     s_t_tensor = torch.tensor([1.0 if x else 0.0 for x in is_correct_baseline_list], device=response_ids.device)
 
     # 构造 Prompts
     prompts_for_vllm = []
-    indices_needing_api = []
     
     for i in range(batch_size):
         l_val = L_list[i]
@@ -247,22 +309,35 @@ def compute_score_batch(
         if l_val == 0:
             prompts_for_vllm.append(None)
         else:
-            # Context + Draft[:L]
-            hybrid_ids = context_ids_list[i] + draft_tokens_list[i][:l_val]
-            prompts_for_vllm.append(hybrid_ids)
-            indices_needing_api.append(i)
+            if l_val < len(draft_tokens_list[i]):
+                # Context + Draft[:L]
+                # 这里是 List 拼接
+                hybrid_ids = context_ids_list[i] + draft_tokens_list[i][:l_val] + target_tokens_list[i][l_val:l_val+1]
+                prompts_for_vllm.append(hybrid_ids)
+            else:
+                # Context + Draft + Bonus
+                # 这里是 List 拼接
+                hybrid_ids = context_ids_list[i] + draft_tokens_list[i] + bonus_tokens_list[i]
+                prompts_for_vllm.append(hybrid_ids)
+            
 
     # -------------------------------------------------------------------------
-    # 3. 批量生成
+    # 3. 批量生成 (使用离线 vLLM)
     # -------------------------------------------------------------------------
     valid_prompts = [p for p in prompts_for_vllm if p is not None]
     completions = []
     
     if valid_prompts:
+        # 生成参数也从环境变量读取
+        _temperature = float(os.getenv("SPD_VLLM_TEMPERATURE", "0.0"))
+        _max_tokens = int(os.getenv("SPD_VLLM_MAX_TOKENS", "1024"))
+        
         completions = batch_vllm_generate(
-            prompts=valid_prompts,
-            api_url=t_url,
-            model=t_name
+            prompt_token_ids=valid_prompts,
+            model_path=m_path,
+            temperature=_temperature,
+            max_tokens=_max_tokens,
+            **vllm_config
         )
     
     # -------------------------------------------------------------------------
@@ -277,18 +352,16 @@ def compute_score_batch(
     
     for i in range(batch_size):
         if prompts_for_vllm[i] is None:
-            # L=0 case
-            s_h_list.append(s_t_tensor[i].item())
+            # L=0 case: 如果一个都没接收, 那么就认为没做对
+            s_h_list.append(0)
         else:
+            # 获取 prompt (context + draft[:l_val] + ...) 和 completion
+            prompt_text = tokenizer.decode(valid_prompts[comp_idx], skip_special_tokens=True)
             completion_text = completions[comp_idx]
             comp_idx += 1
             
-            # Decode accepted text
-            # 这里必须 decode，因为 ground_truth 是文本。
-            # 这是唯一无法完全向量化的部分 (Text Matching)
-            l_val = L_list[i]
-            accepted_text = tokenizer.decode(draft_tokens_list[i][:l_val], skip_special_tokens=True)
-            final_answer = accepted_text + completion_text
+            # 完整答案 = prompt + completion
+            final_answer = prompt_text + completion_text
             gt = ground_truths[i]
             
             if "\\boxed" in gt:
@@ -311,6 +384,20 @@ def compute_score_batch(
     # Cast L_tensor to float for multiplication
     L_float = L_tensor.float()
     
+    # 变量含义注释:
+    # s_t_tensor: [B], target 是否做对 (答案和 target 完全匹配, 1/0)
+    # s_h_tensor: [B], hybrid 形式是否做对 (包含 draft 被采纳+补全后, 是否答对, 1/0)
+    # alpha: 线性奖励系数 (float, 奖励单元长度)
+    # L_float: [B], draft 前缀有效采纳长度 (float)
+    # penalty_break: 中途 break 时的奖励 (float, draft 不完全采纳但未答对)
+    # reward_useless: 完全没答对时的奖励 (float, 没采纳且没答对)
+    # reward_correct: 没采纳 draft 但偶然完全答对时的奖励 (float)
+    #
+    # 各项分别代表以下 case:
+    # term1: target 做对且 hybrid 做对, 给与线性奖励 (鼓励采纳 draft 并答对)
+    # term2: target 做对但 hybrid 没做对, 给 penalty（采纳但没答对）
+    # term3: target 没做对且 hybrid 也没做对, 给“useless”奖励
+    # term4: target 没做对但 hybrid 做对, 给“奇迹”奖励
     term1 = s_t_tensor * s_h_tensor * (alpha * L_float)
     term2 = s_t_tensor * (1.0 - s_h_tensor) * penalty_break
     term3 = (1.0 - s_t_tensor) * (1.0 - s_h_tensor) * reward_useless
@@ -335,9 +422,3 @@ def compute_score_batch(
         for r, l in zip(rewards_list, L_list)
     ]
 
-# 兼容旧接口
-def compute_score(*args, **kwargs):
-    # 如果调用的是单条数据的接口，重定向或者报错
-    # 但为了兼容 NaiveRewardManager，我们保留一个简单的 wrapper
-    # 这里不再实现单条逻辑，建议全部走 compute_score_batch
-    pass

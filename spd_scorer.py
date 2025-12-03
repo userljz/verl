@@ -68,7 +68,10 @@ class SPDInputData:
     
     Attributes:
         input_ids: [Batch, Seq_Len] - 完整输入序列
-        attention_mask: [Batch, Seq_Len] - 注意力掩码
+        attention_mask: 注意力掩码，支持两种格式:
+            - [Batch, Seq_Len]: 简单 Padding Mask (模型内部会自动生成 Causal Mask)
+            - [Batch, 1, Seq_Len, Seq_Len]: 完整 4D Mask (用于自定义 Attention 模式)
+              使用 create_spd_attention_mask() 生成混合 Mask (Context Causal + Draft/Target Bidirectional)
         position_ids: [Batch, Seq_Len] - 位置编码
         draft_start_idx: 每个样本中 Draft Tokens 的起始索引
         draft_end_idx: 每个样本中 Draft Tokens 的结束索引
@@ -472,6 +475,31 @@ class ScoringActor(nn.Module):
         # Step 1: Transformer Forward
         # 通过冻结的 Backbone + LoRA 获取 hidden states
         # ----------------------------------------------------------------------
+        # 处理 Attention Mask (如果是 2D Padding Mask，则升级为 4D SPD Mask)
+        if attention_mask is not None and attention_mask.dim() == 2:
+            if draft_start_idx is not None:
+                # 使用 draft_start_idx 作为分界点 (context_len)
+                # 这意味着 [0, draft_start_idx) 是 Causal 的
+                # [draft_start_idx, end) 是 Bidirectional 的
+                context_lens = draft_start_idx
+                
+                # 计算 seq_lens (Batch 中每个样本的真实长度)
+                seq_lens = attention_mask.sum(dim=-1)
+                
+                # 获取 max_seq_len (用于 4D mask 尺寸)
+                max_seq_len = input_ids.size(1)
+                
+                # 创建 4D Mask
+                # 注意: 需要确保 draft_len/target_len 逻辑与 mask 创建一致
+                # 这里主要依赖 context_lens 和 seq_lens
+                attention_mask = create_spd_attention_mask(
+                    context_lens=context_lens,
+                    seq_lens=seq_lens,
+                    padding_mask=attention_mask,
+                    dtype=self.backbone.dtype if hasattr(self.backbone, "dtype") else torch.bfloat16
+                )
+                logging.debug("已自动将 2D attention_mask 升级为 4D SPD Mask")
+
         # 既然强制使用了 LoRA，self.transformer 就是 PeftModel
         # 我们直接调用 base_model 以获取原始 Transformer 的输出
         transformer_outputs = self.transformer.base_model(
@@ -549,97 +577,237 @@ class ScoringActor(nn.Module):
         return [p for p in self.parameters() if p.requires_grad]
 
 
-# ==============================================================================
-# 4. 奖励函数实现
-# ==============================================================================
 
-# 直接从 spd_scorer_reward 导入
-try:
-    from verl.utils.reward_score.spd_scorer_reward import compute_score_batch as compute_reward_tensor
-except ImportError:
-    pass
 
+class AutoModelForSPDScoring:
+    """
+    模拟 AutoModel 的工厂类，用于 verl 的加载流程适配
+    """
+    @classmethod
+    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+        return cls.from_config(pretrained_model_name_or_path, **kwargs)
+
+    @classmethod
+    def from_config(cls, config, **kwargs):
+        """
+        Args:
+            config: HuggingFace PretrainedConfig
+            kwargs: 其他参数
+        """
+        # 优先从环境变量读取配置 (由 train_spd_scorer.py 注入)
+        # 这避免了在 verl 复杂的调用栈中透传参数的困难
+        model_path = os.getenv("SPD_MODEL_PATH", getattr(config, "_name_or_path", "meta-llama/Llama-3-8B"))
+        
+        # LoRA 配置
+        lora_rank = int(os.getenv("SPD_LORA_RANK", "16"))
+        lora_alpha = int(os.getenv("SPD_LORA_ALPHA", "32"))
+        
+        # 记录一下实际使用的配置，方便调试
+        logging.info(f"[AutoModelForSPDScoring] Initializing with env vars:")
+        logging.info(f"  - Model Path: {model_path}")
+        logging.info(f"  - LoRA Rank: {lora_rank}")
+        logging.info(f"  - LoRA Alpha: {lora_alpha}")
+        
+        # 创建 SPD Config
+        spd_config = ScoringModelConfig(
+            model_name_or_path=model_path,
+            hidden_size=getattr(config, 'hidden_size', 4096),
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            # 其他参数...
+        )
+        
+        # 2. 实例化 Actor
+        model = ScoringActor(spd_config)
+        return model
 
 # ==============================================================================
 # 5. 辅助工具函数
 # ==============================================================================
 
-def parse_input_sequence(
-    input_ids: torch.Tensor,
-    sep_token_id: int
-) -> Dict[str, Any]:
+def create_hybrid_attention_mask(
+    seq_len: int,
+    context_len: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
     """
-    解析输入序列 (Fixed Length Optimization)
+    创建单样本的混合 Attention Mask
     
-    假设: 所有样本的 Draft Length 和 Target Length 相同
+    Attention 策略:
+        - [0, context_len): Causal Mask
+        - [context_len, seq_len): Full Bidirectional Mask
+    
+    Args:
+        seq_len: 当前样本的总长度
+        context_len: 上下文分界点
+    
+    Returns:
+        mask: [Seq_Len, Seq_Len] (2D)
     """
-    batch_size, seq_len = input_ids.shape
-    device = input_ids.device
+    mask = torch.zeros(seq_len, seq_len, device=device, dtype=dtype)
     
-    # 1. 识别 SEP 位置 (依然需要 cumsum 来定位第 1,2,3 个 SEP)
-    # 即使长度固定，Context 长度可能不同，所以 SEP 位置是不同的
-    is_sep = (input_ids == sep_token_id)
-    sep_cumsum = is_sep.cumsum(dim=1)
+    # 1. Context 部分: Causal
+    mask[:context_len, :context_len] = torch.tril(
+        torch.ones(context_len, context_len, device=device, dtype=dtype)
+    )
     
-    def get_nth_sep_idx(n):
-        # argmax returns first True index
-        idx = ((sep_cumsum == n) & is_sep).float().argmax(dim=1)
-        return idx
-
-    sep1_idx = get_nth_sep_idx(1)
-    sep2_idx = get_nth_sep_idx(2)
-    sep3_idx = get_nth_sep_idx(3)
-    
-    # 2. 计算各段索引
-    context_end_idx = sep1_idx
-    draft_start_idx = sep1_idx + 1
-    draft_end_idx = sep2_idx
-    target_start_idx = sep2_idx + 1
-    target_end_idx = sep3_idx
-    
-    # 3. 提取 Tensors (Fixed Length)
-    # 假设 Draft 和 Target 长度固定，取第一个样本的长度
-    draft_len = (draft_end_idx[0] - draft_start_idx[0]).item()
-    target_len = (target_end_idx[0] - target_start_idx[0]).item()
-    
-    def extract_fixed_len(start_idxs, length):
-        if length <= 0:
-            return torch.zeros(batch_size, 0, dtype=torch.long, device=device)
-            
-        grid = torch.arange(length, device=device).unsqueeze(0) # [1, L]
-        gather_indices = start_idxs.unsqueeze(1) + grid # [B, L]
+    # 2. 后半部分: Full Bidirectional
+    mask[context_len:, :] = 1.0
         
-        # Clamp to avoid out of bounds if data is noisy (though we assume it's clean)
-        gather_indices = gather_indices.clamp(max=seq_len - 1)
+    return mask
+
+
+def create_hybrid_attention_mask_batch(
+    context_lens: List[int],
+    seq_lens: List[int],
+    max_seq_len: int,
+    device: torch.device,
+    dtype: torch.dtype = torch.float32,
+    is_left_padding: bool = True, # 默认为 Left Padding
+) -> torch.Tensor:
+    """
+    批量创建混合 Attention Mask (处理变长序列)
+    
+    Args:
+        context_lens: 每个样本的 Context 长度列表
+        seq_lens: 每个样本的总长度列表
+        max_seq_len: Batch 内的最大长度
+        is_left_padding: 是否为 Left Padding (verl 默认 True)
+    
+    Returns:
+        batch_mask: [Batch, 1, Max_Seq_Len, Max_Seq_Len]
+    """
+    batch_size = len(context_lens)
+    batch_mask = torch.zeros(batch_size, 1, max_seq_len, max_seq_len, device=device, dtype=dtype)
+    
+    for i in range(batch_size):
+        c_len = context_lens[i]
+        s_len = seq_lens[i]
         
-        return torch.gather(input_ids, 1, gather_indices)
+        # 生成单样本 Mask [s_len, s_len]
+        single_mask = create_hybrid_attention_mask(s_len, c_len, device, dtype)
+        
+        if is_left_padding:
+            # Left Padding: 数据靠右对齐
+            # 有效数据区域: [max_seq_len - s_len : max_seq_len]
+            offset = max_seq_len - s_len
+            batch_mask[i, 0, offset:, offset:] = single_mask
+        else:
+            # Right Padding: 数据靠左对齐 (默认)
+            # 有效数据区域: [0 : s_len]
+            batch_mask[i, 0, :s_len, :s_len] = single_mask
+        
+    return batch_mask
 
-    draft_tokens = extract_fixed_len(draft_start_idx, draft_len)
-    target_tokens = extract_fixed_len(target_start_idx, target_len)
-    
-    # Context 依然是变长的，需要 Mask 处理
-    # 这里保留之前的 Mask 逻辑或者简化为 List?
-    # spd_scorer_reward 需要 Padded Context
-    # Let's use the general method for Context since it varies
-    
-    c_max_len = context_end_idx.max().item()
-    c_grid = torch.arange(c_max_len, device=device).unsqueeze(0)
-    c_gather = c_grid # [1, MaxCtx] (start is 0)
-    c_mask = c_grid < context_end_idx.unsqueeze(1)
-    
-    context_ids = torch.gather(input_ids, 1, c_gather.expand(batch_size, -1).clamp(max=seq_len-1))
-    context_ids = context_ids * c_mask.long() # Zero padding
 
-    return {
-        "context_end_idx": context_end_idx,
-        "draft_start_idx": draft_start_idx,
-        "draft_end_idx": draft_end_idx,
-        "target_start_idx": target_start_idx,
-        "target_end_idx": target_end_idx,
-        "draft_tokens": draft_tokens,
-        "target_tokens": target_tokens,
-        "context_ids": context_ids,
-    }
+def combine_hybrid_and_padding_mask(
+    hybrid_mask: torch.Tensor,
+    padding_mask: torch.Tensor,
+) -> torch.Tensor:
+    """
+    将 Hybrid Mask 与 Padding Mask 结合
+    
+    Args:
+        hybrid_mask: [Batch, 1, Seq_Len, Seq_Len] - 混合注意力 Mask (1=可见, 0=不可见)
+        padding_mask: [Batch, Seq_Len] - Padding Mask (1=真实Token, 0=Padding)
+    
+    Returns:
+        combined_mask: [Batch, 1, Seq_Len, Seq_Len] - 结合后的 Mask (1=可见, 0=不可见)
+    """
+    batch_size, _, seq_len, _ = hybrid_mask.shape
+    device = hybrid_mask.device
+    dtype = hybrid_mask.dtype
+    
+    # 扩展 padding_mask 为 4D
+    # [Batch, Seq_Len] -> [Batch, 1, 1, Seq_Len] (Key 维度的 Mask)
+    # 表示: 哪些 Key 位置是有效的 (可以被 attend 到)
+    padding_mask_4d = padding_mask.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, S]
+    padding_mask_4d = padding_mask_4d.to(dtype)
+    
+    # 结合: 两者都为 1 时才能 attend
+    # hybrid_mask: [B, 1, S, S] - 结构性 Mask (Causal/Bidirectional)
+    # padding_mask_4d: [B, 1, 1, S] - 广播到 [B, 1, S, S]
+    combined_mask = hybrid_mask * padding_mask_4d
+    
+    return combined_mask
+
+
+def convert_mask_to_4d_attention_mask(
+    combined_mask: torch.Tensor,
+    dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """
+    将 0/1 Mask 转换为 Hugging Face 模型可用的 4D Attention Mask
+    
+    Hugging Face 的 Attention 实现期望:
+        - 可以 attend 的位置: 0
+        - 不能 attend 的位置: 一个很大的负数 (如 -10000 或 -inf)
+    
+    Args:
+        combined_mask: [Batch, 1, Seq_Len, Seq_Len], 1 = 可以看到, 0 = 不能看到
+        dtype: 输出数据类型
+    
+    Returns:
+        attention_mask: [Batch, 1, Seq_Len, Seq_Len], 0 = 可以看到, -large = 不能看到
+    """
+    # 将 1 变成 0, 0 变成 -inf (或一个很大的负数)
+    # 使用 torch.finfo(dtype).min 可能导致数值问题，使用 -10000 更安全
+    inverted_mask = 1.0 - combined_mask.to(dtype)
+    attention_mask = inverted_mask * torch.finfo(dtype).min
+    
+    return attention_mask
+
+
+def create_spd_attention_mask(
+    context_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    padding_mask: torch.Tensor,
+    dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """
+    一站式创建 SPD 场景的完整 4D Attention Mask (支持 Batch 变长 Context)
+    
+    Args:
+        context_lens: [Batch] 每个样本的 Context 长度 (分界点)
+        seq_lens: [Batch] 每个样本的总长度
+        padding_mask: [Batch, Max_Seq_Len] - Padding Mask
+        dtype: 数据类型
+    
+    Returns:
+        attention_mask: [Batch, 1, Max_Seq_Len, Max_Seq_Len]
+    """
+    batch_size = padding_mask.shape[0]
+    max_seq_len = padding_mask.shape[1]
+    device = padding_mask.device
+    
+    # 转换为 List 以便循环
+    c_lens = context_lens.tolist()
+    s_lens = seq_lens.tolist()
+    
+    # Step 1: 创建 Batch Hybrid Mask
+    hybrid_mask = create_hybrid_attention_mask_batch(
+        context_lens=c_lens,
+        seq_lens=s_lens,
+        max_seq_len=max_seq_len, # 显式传入画布大小
+        device=device,
+        dtype=torch.float32,
+        is_left_padding=True # 显式指定 Left Padding
+    )
+    
+    # Step 2: 与 Padding Mask 结合
+    combined_mask = combine_hybrid_and_padding_mask(
+        hybrid_mask=hybrid_mask,
+        padding_mask=padding_mask,
+    )
+    
+    # Step 3: 转换为 Attention Mask 格式
+    attention_mask = convert_mask_to_4d_attention_mask(
+        combined_mask=combined_mask,
+        dtype=dtype,
+    )
+    
+    return attention_mask
 
 
 def create_position_ids(attention_mask: torch.Tensor) -> torch.Tensor:
@@ -657,10 +825,4 @@ def create_position_ids(attention_mask: torch.Tensor) -> torch.Tensor:
     position_ids.masked_fill_(attention_mask == 0, 0)
     return position_ids
 
-
-# ==============================================================================
-# 6. 训练集成示例
-# ==============================================================================
-
-# (Toy example code removed)
 

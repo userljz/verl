@@ -1,127 +1,100 @@
 # SPD Scorer 对 verl 库的修改记录
 
-> **文档版本**: 1.2  
-> **更新日期**: 2025-11-25  
-> **目的**: 记录为实现 Speculative Decoding Scoring Model 对原始 verl 库所做的所有修改
+> **文档版本**: 1.4  
+> **更新日期**: 2025-11-26  
+> **目的**: 详细记录为实现 Speculative Decoding Scoring Model 对原始 verl 库所做的所有修改及新增模块的功能说明。
 
 ---
 
 ## 📋 修改概览
 
-| 类型 | 文件路径 | 说明 |
-|------|----------|------|
-| ✨ 新增 | `spd_scorer.py` | SPD Scorer 模型核心实现 |
-| ✨ 新增 | `train_spd_scorer.py` | GRPO 训练脚本 (支持 API 补全) |
-| ✨ 新增 | `verl/workers/rollout/spd_rollout.py` | 自定义 Rollout 策略 (Bernoulli 采样) |
-| ✨ 新增 | `verl/utils/reward_score/spd_scorer_reward.py` | 自定义 Reward Function (支持 API 补全) |
-| ✏️ 修改 | `verl/utils/reward_score/__init__.py` | 注册新的 Reward Function |
-| ✏️ 修改 | `verl/workers/rollout/base.py` | 注册新的 Rollout 类 |
+为了实现 Speculative Decoding Scorer (SPD Scorer) 的训练，我们基于 verl 框架进行了扩展。所有的修改旨在实现以下核心流程：
+1.  **自定义模型**: 使用 `ScoringActor` 替代标准 LLM，输出对 Draft Token 的 Accept/Reject 概率。
+2.  **自定义 Rollout**: 使用 `SPDRollout` 执行一次 Forward 并进行 Bernoulli 采样，而非自回归生成。
+3.  **自定义 Reward**: 使用 `spd_scorer_reward` 基于 Draft 接受长度和最终答案正确性计算复杂奖励。
+4.  **自定义数据管道**: 预处理 Context + Draft + Target 的特殊输入格式。
+
+### 文件清单
+
+#### ✨ 新增文件 (New Files)
+| 文件路径 | 模块/类 | 说明 |
+|:---|:---|:---|
+| `spd_scorer.py` | `ScoringActor` | SPD Scorer 模型核心实现。新增 `AutoModelForSPDScoring` 工厂类适配 verl 加载流程。 |
+| `verl/workers/rollout/spd_rollout.py` | `SPDRollout` | 自定义 Rollout 策略，执行非自回归的 Bernoulli 采样。 |
+| `verl/utils/reward_score/spd_scorer_reward.py` | `compute_score` | 自定义 Reward Function，集成 vLLM 离线推理进行补全验证。 |
+| `verl/utils/dataset/spd_dataset.py` | `SPDRLHFDataset` | 自定义 Dataset，支持预计算的 `input_ids` 和索引偏移修正。 |
+| `train_spd_scorer.py` | `run_training` | 训练入口脚本。**包含 Monkey Patch 逻辑** 以强制加载 SPD 模型。 |
+
+#### ✏️ 修改文件 (Modified Files)
+| 文件路径 | 修改内容 | 说明 |
+|:---|:---|:---|
+| `verl/utils/reward_score/__init__.py` | `default_compute_score` | 注册 `spd_scorer` 数据源，分发参数到新的 Reward Function。 |
+| `verl/workers/rollout/base.py` | `_ROLLOUT_REGISTRY` | 注册 `("spd", "sync")` 对应的 Rollout 类。 |
 
 ---
 
-## 1. 核心架构更新：补全与验证
+## 🔍 详细模块说明
 
-为了解决显存限制问题，我们采用 **Remote vLLM Completion** 架构：
+### 1. 模型层: `spd_scorer.py`
 
-1.  **Rollout Worker** (`spd_rollout.py`):
-    - 只持有 **Scorer (Actor)** 模型。
-    - 负责推理并生成 Accept/Reject 序列。
-    - **不进行** Target Model 的补全生成 (避免 OOM)。
+此文件定义了 SPD Scorer 的模型架构。模型基于 Llama-3-8B (Backbone) + LoRA + Score Head。
 
-2.  **Reward Function** (`spd_scorer_reward.py`):
-    - 负责奖励计算。
-    - 通过 HTTP API 调用外部 **vLLM 服务** (持有 Target Model)。
-    - 流程:
-        1. 接收 Rollout 生成的决策序列。
-        2. 构造 Hybrid Prefix = Context + Accepted Tokens。
-        3. 调用 API 进行确定性补全 (`temperature=0`)。
-        4. 验证补全结果是否包含 Ground Truth。
+*   **`ScoringModelConfig` (Class)**: 配置类，定义了 `hidden_size`, `lora_rank` 等超参数。
+*   **`ScoreHead` (Class)**: 简单的 MLP，将 Hidden States 映射为 Accept/Reject Logit。
+*   **`ScoringActor` (Class)**:
+    *   **Mismatch Mask**: 在 Forward 中，强制 Match 位置的 logit 为极大概率，确保 Ground Truth 必定被 Accept。
+*   **`AutoModelForSPDScoring` (Class)**:
+    *   **新增**: 一个工厂类，模拟 `AutoModel` 的接口 (`from_pretrained`, `from_config`)。
+    *   作用：作为适配器，将 verl 的标准加载调用转换为 `ScoringActor` 的初始化调用。
 
----
+### 2. 执行层: `verl/workers/rollout/spd_rollout.py`
 
-## 2. 新增文件
+此文件实现了 SPD 专用的 Rollout 策略，替代了 verl 默认的自回归生成。
 
-### 2.1 `spd_scorer.py` (根目录)
+*   **`SPDRollout` (Class)**:
+    *   继承自 `BaseRollout`。
+    *   **`generate_sequences`**: 执行单次 Forward -> Bernoulli 采样 -> 构造 Loss Mask (屏蔽 Match 位置和 Padding)。
 
-**位置**: `verl/spd_scorer.py`
+### 3. 评估层: `verl/utils/reward_score/spd_scorer_reward.py`
 
-**关键功能**:
-- `ScoringActor`: 核心模型，Score Head，Mismatch Mask。
-- `compute_reward_tensor`: 独立训练用的张量版本奖励函数。
+此文件实现了复杂的 Reward 计算逻辑。
 
-### 2.2 `train_spd_scorer.py` (根目录)
+*   **`compute_score` (Function)**:
+    *   利用 `response_ids` 计算有效长度 L。
+    *   构造 `Context` + `Draft[:L]` 并调用 vLLM 进行补全。
+    *   验证补全结果，应用四场景奖励公式。
 
-**位置**: `verl/train_spd_scorer.py`
+### 4. 数据层: `verl/utils/dataset/spd_dataset.py`
 
-**更新**:
-- 支持 `--target_model_url` 参数。
-- 将 `context_text` 等关键信息通过 `extra_info` 传递给 Reward Function。
+自定义 Dataset，优化了数据加载流程。
 
-**使用方法**:
-```bash
-# 启动训练 (需要先启动一个 vLLM 服务作为 Target Model)
-python train_spd_scorer.py \
-    --model_path meta-llama/Llama-3-8B \
-    --target_model_url http://localhost:8000/v1/completions \
-    --n_gpus 8
-```
+*   **`SPDRLHFDataset` (Class)**:
+    *   自动修正 Left Padding 带来的索引 (`draft_start_idx`) 偏移。
+    *   跳过默认的 Chat Template 处理，直接使用预处理好的 `input_ids`。
 
-### 2.3 `verl/workers/rollout/spd_rollout.py`
+### 5. 训练入口: `train_spd_scorer.py`
 
-**位置**: `verl/workers/rollout/spd_rollout.py`
+负责数据准备和启动训练。
 
-**说明**:
-- 专用于 SPD 任务的 Rollout。
-- 使用 `ScoringActor` 进行推理。
-- 执行 Bernoulli 采样生成 N 个 0/1 序列。
+*   **Monkey Patch (关键 Hack)**:
+    *   为了在不修改 `verl/utils/model.py` 的前提下让 verl 加载自定义的 `ScoringActor`，我们在脚本开头执行了 Monkey Patch。
+    *   **被替换函数**: `verl.utils.model.create_huggingface_actor`
+    *   **替换逻辑**: 拦截调用，直接返回 `AutoModelForSPDScoring.from_config(...)` 创建的 `ScoringActor` 实例。
 
-### 2.4 `verl/utils/reward_score/spd_scorer_reward.py`
+### 6. 注册修改 (原有文件)
 
-**位置**: `verl/utils/reward_score/spd_scorer_reward.py`
+为了让 verl 识别上述自定义模块，对原有文件进行了少量修改：
 
-**关键更新**:
-- 新增 `vllm_generate` 函数，封装 HTTP 请求。
-- `verify_hybrid_correctness` 支持调用远程 API 进行补全验证。
-- 支持本地 Tokenizer 缓存，用于编解码。
+*   **`verl/utils/reward_score/__init__.py`**: 在 `default_compute_score` 中增加了 `spd_scorer` 分支。
+*   **`verl/workers/rollout/base.py`**: 注册了 `("spd", "sync")` Rollout。
 
 ---
 
-## 3. 修改的文件
+## 🚀 训练流程总结
 
-### 3.1 `verl/utils/reward_score/__init__.py`
-
-**修改**:
-- 注册 `spd_scorer` data_source。
-- 从 `extra_info` 中解包 `context_text`, `target_model_url`, `model_path` 等参数并传递给 `compute_score`。
-
-### 3.2 `verl/workers/rollout/base.py`
-
-**修改**:
-- 注册 `("spd", "sync")` 到 `_ROLLOUT_REGISTRY`。
-
----
-
-## 4. 训练流程详解
-
-1.  **准备阶段**:
-    - 启动 Target Model 的 vLLM 服务 (例如在另一组 GPU 上)。
-    - 运行 `train_spd_scorer.py`。
-
-2.  **Rollout 阶段**:
-    - `SPDRollout` 使用 Scorer 生成 Accept/Reject 掩码。
-
-3.  **Evaluation 阶段**:
-    - `RewardManager` 调用 `spd_scorer_reward.py`。
-    - 如果配置了 API URL，脚本将构造 Hybrid Prefix 并请求 vLLM 补全。
-    - 验证补全结果，计算四场景奖励 (A/B/C/D)。
-
-4.  **Update 阶段**:
-    - GRPO 更新 Scorer 参数。
-
----
-
-## 5. 依赖说明
-
-- 需要安装 `requests`: `pip install requests`
-- 需要安装 `vllm` (用于 Rollout 和 外部服务)
-
+1.  **启动**: 运行 `train_spd_scorer.py`。
+2.  **Patch**: 脚本首先应用 Monkey Patch，劫持模型加载逻辑。
+3.  **加载**: verl Trainer 调用 `create_huggingface_actor`，被重定向到 `AutoModelForSPDScoring`，加载 `ScoringActor`。
+4.  **数据**: `SPDRLHFDataset` 加载数据并修正索引。
+5.  **Rollout & Reward**: `SPDRollout` 和 `spd_scorer_reward` 执行采样和评分。
+6.  **更新**: GRPO 更新模型参数。
