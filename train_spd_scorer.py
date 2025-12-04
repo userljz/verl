@@ -16,12 +16,11 @@ Speculative Decoding Scorer 训练脚本
 import os
 import sys
 import subprocess
-import logging
 from typing import Optional, Dict, List, Tuple
-from dataclasses import dataclass, field
 
 import torch
 import pandas as pd
+from loguru import logger
 
 from transformers import AutoTokenizer
 
@@ -66,79 +65,34 @@ verl.utils.model.create_huggingface_actor = _patched_create_huggingface_actor
 logger.info("✅ 已应用 Monkey Patch: verl.utils.model.create_huggingface_actor -> AutoModelForSPDScoring")
 
 # ==============================================================================
-
-# 设置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
-
-# ==============================================================================
-# 1. 配置定义
-# ==============================================================================
-
-@dataclass
-class SPDTrainingConfig:
-    """SPD Scorer 训练配置"""
-    
-    # 模型路径
-    model_path: str = "meta-llama/Llama-3-8B"
-    
-    # 数据路径
-    data_dir: str = "data/spd_scorer"
-    train_file: str = "train.parquet"
-    val_file: str = "val.parquet"
-    
-    # LoRA 配置
-    lora_rank: int = 16
-    lora_alpha: int = 32
-    lora_target_modules: List[str] = field(default_factory=lambda: ["q_proj", "k_proj", "v_proj", "o_proj"])
-    
-    # 训练超参数
-    n_gpus: int = 8
-    train_batch_size: int = 64
-    ppo_mini_batch_size: int = 32
-    micro_batch_size_per_gpu: int = 4
-    rollout_n: int = 8  # GRPO: 每个样本采样 N 个决策序列
-    total_epochs: int = 3
-    
-    # 奖励系数
-    reward_alpha: float = 1.0          # 场景 A: alpha * L
-    reward_penalty_break: float = -10.0  # 场景 B: 破坏正确答案
-    reward_correct: float = 100.0       # 场景 D: 纠正错误
-    reward_useless: float = 0.0         # 场景 C: 无用尝试
-    
-    # 特殊 Token
-    sep_token: str = "<|sep|>"
-    sep_token_id: int = 128009  # Llama-3 的 <|eot_id|>，可根据实际情况调整
-    
-    # 补全服务配置
-    target_model_url: Optional[str] = None  # e.g. "http://localhost:8000/v1/completions"
-    target_model_name: str = "target-model"
-    
-    # 其他配置
-    vllm_gpu_memory_utilization: float = 0.7
-    offload: bool = False
-    use_wandb: bool = True
-    project_name: str = "verl_spd_scorer"
-    experiment_name: str = "spd_grpo_training"
-
-
-# ==============================================================================
 # 2. 数据准备
 # ==============================================================================
 def prepare_spd_data_from_real_source(
-    config: SPDTrainingConfig,
+    args,
     source_data_path: List[str],
 ) -> Tuple[str, str]:
     """
     从真实数据源 (SPD生成数据 + Metadata) 准备 SPD 训练数据
     
     Args:
-        config: 训练配置
+        args: 训练配置参数 (argparse.Namespace)
         source_data_path: 包含两个文件路径的列表 [spd_gen_data_file, metadata_file]
     """
+    # 1. 计算目标路径
+    train_file = getattr(args, "train_file", "train.parquet")
+    val_file = getattr(args, "val_file", "val.parquet")
+    
+    train_path = os.path.join(args.data_dir, train_file)
+    val_path = os.path.join(args.data_dir, val_file)
+    
+    # 2. 检查是否跳过 (Cache Hit)
+    overwrite = getattr(args, "overwrite_data", False)
+    if os.path.exists(train_path) and os.path.exists(val_path) and not overwrite:
+        logger.info(f"训练数据已存在，跳过预处理步骤。")
+        logger.info(f"Train: {train_path}")
+        logger.info(f"Val:   {val_path}")
+        return train_path, val_path
+
     if len(source_data_path) != 2:
         raise ValueError("source_data_path 必须是包含两个元素的列表: [spd_gen_data_file, metadata_file]")
     
@@ -148,8 +102,8 @@ def prepare_spd_data_from_real_source(
     logger.info(f"Metadata File: {meta_file}")
     
     # 加载 Tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(config.model_path, trust_remote_code=True)
-    logger.info(f"Tokenizer 加载成功: {config.model_path}")
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    logger.info(f"Tokenizer 加载成功: {args.model_path}")
     
     # 1. 加载 Metadata 到内存字典 (Index -> Data)
     logger.info("加载 Metadata...")
@@ -163,7 +117,7 @@ def prepare_spd_data_from_real_source(
     spd_gen_df = pd.read_json(spd_gen_data_file, lines=True)
     logger.info(f"SPD 生成数据量: {len(spd_gen_df)}")
     
-    os.makedirs(config.data_dir, exist_ok=True)
+    os.makedirs(args.data_dir, exist_ok=True)
     processed_data = []
     
     for idx, row in spd_gen_df.iterrows():
@@ -233,7 +187,10 @@ def prepare_spd_data_from_real_source(
         # =================================================================
         
         # 获取 SEP Token ID (Llama-3 eot_id)
-        sep_token_id = config.sep_token_id
+        if args.sep_token_id == "eot":
+            sep_token_id = tokenizer.eos_token_id if hasattr(tokenizer, "eos_token_id") else tokenizer.eot_token_id
+        else:
+            raise ValueError(f"Invalid sep_token_id: {args.sep_token_id}")
         
         # 拼接
         # 注意: 这里假设 draft_ids 和 target_ids 已经是 list[int]
@@ -307,9 +264,6 @@ def prepare_spd_data_from_real_source(
     train_df = df.iloc[:train_size]
     val_df = df.iloc[train_size:]
     
-    train_path = os.path.join(config.data_dir, config.train_file)
-    val_path = os.path.join(config.data_dir, config.val_file)
-    
     train_df.to_parquet(train_path)
     val_df.to_parquet(val_path)
     
@@ -322,12 +276,12 @@ def prepare_spd_data_from_real_source(
 # 3. 训练主函数
 # ==============================================================================
 
-def build_training_command(config: SPDTrainingConfig, train_file: str, val_file: str) -> list:
+def build_training_command(args, train_file: str, val_file: str) -> list:
     """
     构建 verl GRPO 训练命令
     
     Args:
-        config: 训练配置
+        args: 训练配置参数 (argparse.Namespace)
         train_file: 训练数据路径
         val_file: 验证数据路径
     
@@ -356,64 +310,64 @@ def build_training_command(config: SPDTrainingConfig, train_file: str, val_file:
         "data.custom_cls.path=verl.utils.dataset.spd_dataset",
         "data.custom_cls.name=SPDRLHFDataset",
         
-        f"data.train_batch_size={config.train_batch_size}",
+        f"data.train_batch_size={args.train_batch_size}",
         "data.max_prompt_length=2048",         # 包含 Context + Draft + Target
-        "data.max_response_length=256",        # 输出是 Accept/Reject 决策序列
+        "data.max_response_length=50",        # 输出是 Accept/Reject 决策序列
         
         # =================================================================
         # 模型配置
         # =================================================================
-        f"actor_rollout_ref.model.path={config.model_path}",
+        f"actor_rollout_ref.model.path={args.model_path}",
         "actor_rollout_ref.model.use_remove_padding=True",
         
         # LoRA 配置
-        f"actor_rollout_ref.model.lora_rank={config.lora_rank}",
-        f"actor_rollout_ref.model.lora_alpha={config.lora_alpha}",
+        f"actor_rollout_ref.model.lora_rank={args.lora_rank}",
+        f"actor_rollout_ref.model.lora_alpha={args.lora_alpha}",
         
         # =================================================================
         # Rollout 配置
         # =================================================================
-        f"actor_rollout_ref.rollout.n={config.rollout_n}",
+        f"actor_rollout_ref.rollout.n={args.rollout_n}",
         "actor_rollout_ref.rollout.name=spd",  # 使用自定义的 SPD Rollout
-        f"actor_rollout_ref.rollout.gpu_memory_utilization={config.vllm_gpu_memory_utilization}",
+        f"actor_rollout_ref.rollout.gpu_memory_utilization={args.vllm_gpu_memory_utilization}",
         "actor_rollout_ref.rollout.free_cache_engine=False",
-        f"actor_rollout_ref.rollout.data_parallel_size={config.n_gpus}",
+        f"actor_rollout_ref.rollout.data_parallel_size={args.n_gpus}",
         "actor_rollout_ref.rollout.enforce_eager=True",
         "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
         "actor_rollout_ref.rollout.enable_chunked_prefill=False",
         "actor_rollout_ref.rollout.max_num_batched_tokens=8192",
-        f"actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu={config.micro_batch_size_per_gpu}",
+        f"actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu={args.micro_batch_size_per_gpu}",
         
         # =================================================================
         # Actor 训练配置
         # =================================================================
-        f"actor_rollout_ref.actor.ppo_mini_batch_size={config.ppo_mini_batch_size}",
-        f"actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu={config.micro_batch_size_per_gpu}",
+        f"actor_rollout_ref.actor.ppo_mini_batch_size={args.ppo_mini_batch_size}",
+        f"actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu={args.micro_batch_size_per_gpu}",
         "actor_rollout_ref.actor.use_kl_loss=True",
         "actor_rollout_ref.actor.kl_loss_coef=0.001",
-        f"actor_rollout_ref.actor.fsdp_config.param_offload={config.offload}",
-        f"actor_rollout_ref.actor.fsdp_config.optimizer_offload={config.offload}",
+        f"actor_rollout_ref.actor.fsdp_config.param_offload={args.offload}",
+        f"actor_rollout_ref.actor.fsdp_config.optimizer_offload={args.offload}",
         
         # =================================================================
         # Reference 配置
         # =================================================================
-        f"actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu={config.micro_batch_size_per_gpu}",
-        f"actor_rollout_ref.ref.fsdp_config.param_offload={config.offload}",
+        f"actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu={args.micro_batch_size_per_gpu}",
+        f"actor_rollout_ref.ref.fsdp_config.param_offload={args.offload}",
         
         # =================================================================
         # Trainer 配置
         # =================================================================
-        f"trainer.total_epochs={config.total_epochs}",
-        f"trainer.n_gpus_per_node={config.n_gpus}",
+        f"trainer.total_epochs={args.total_epochs}",
+        f"trainer.n_gpus_per_node={args.n_gpus}",
         "trainer.nnodes=1",
-        f"trainer.project_name={config.project_name}",
-        f"trainer.experiment_name={config.experiment_name}",
+        f"trainer.project_name={args.project_name}",
+        f"trainer.experiment_name={args.experiment_name}",
         "trainer.test_freq=10",
         "trainer.save_freq=-1",
     ]
     
     # 日志配置
-    if config.use_wandb:
+    if not args.no_wandb:
         cmd.append("trainer.logger=['console','wandb']")
     else:
         cmd.append("trainer.logger=['console']")
@@ -421,7 +375,7 @@ def build_training_command(config: SPDTrainingConfig, train_file: str, val_file:
     return cmd
 
 
-def run_training(config: SPDTrainingConfig, source_data_path: List[str]):
+def run_training(args, source_data_path: List[str]):
     """
     运行 SPD Scorer 训练
     
@@ -430,7 +384,7 @@ def run_training(config: SPDTrainingConfig, source_data_path: List[str]):
         2. 构建并执行训练命令
     
     Args:
-        config: 训练配置
+        args: 训练配置参数 (argparse.Namespace)
         source_data_path: 包含两个文件路径的列表 [spd_gen_data_file, metadata_file]
     """
     logger.info("=" * 60)
@@ -439,11 +393,11 @@ def run_training(config: SPDTrainingConfig, source_data_path: List[str]):
     
     # Step 1: 准备数据
     logger.info("\n[Step 1] 准备训练数据...")
-    train_file, val_file = prepare_spd_data_from_real_source(config, source_data_path)
+    train_file, val_file = prepare_spd_data_from_real_source(args, source_data_path)
     
     # Step 2: 构建训练命令
     logger.info("\n[Step 2] 构建训练命令...")
-    cmd = build_training_command(config, train_file, val_file)
+    cmd = build_training_command(args, train_file, val_file)
     
     logger.info("\n训练命令:")
     logger.info(" ".join(cmd[:5]) + " \\")
@@ -454,129 +408,49 @@ def run_training(config: SPDTrainingConfig, source_data_path: List[str]):
     logger.info("\n[Step 3] 启动训练...")
     logger.info("=" * 60)
     
-    offload_status = "ON" if config.offload else "OFF"
     logger.info(f"🚀 开始 SPD Scorer GRPO 训练")
-    logger.info(f"配置: {config.n_gpus} GPU | Batch={config.train_batch_size} | Rollout N={config.rollout_n} | Offload={offload_status}")
+    logger.info(f"配置: {args.n_gpus} GPU | Batch={args.train_batch_size} | Rollout N={args.rollout_n} | Offload={'ON' if args.offload else 'OFF'}")
     logger.info("=" * 60)
     
-    try:
-        # 获取包含奖励配置的环境变量
-        env = _get_reward_config_env(config)
+    # 创建训练环境变量
+    env = _create_training_env(args)
+    
+    subprocess.run(cmd, check=True, env=env)
         
-        # [NEW] 将模型配置也注入环境变量，供 spd_scorer.py 读取
-        env["SPD_MODEL_PATH"] = str(config.model_path)
-        env["SPD_LORA_RANK"] = str(config.lora_rank)
-        env["SPD_LORA_ALPHA"] = str(config.lora_alpha)
-        
-        env["HYDRA_FULL_ERROR"] = "1"
-        env["NCCL_P2P_DISABLE"] = "1"
-        
-        subprocess.run(cmd, check=True, env=env)
-        
-    except subprocess.CalledProcessError as e:
-        logger.error(f"\n训练过程中出错: {e}")
-        raise
-    except KeyboardInterrupt:
-        logger.info("\n训练被用户中断。")
+ 
 
-
-def _get_reward_config_env(config: SPDTrainingConfig) -> Dict[str, str]:
-    """生成 Reward Function 所需的环境变量"""
+def _create_training_env(args) -> Dict[str, str]:
+    """
+    生成训练子进程所需的环境变量
+    
+    包含:
+    1. Reward Function 配置
+    2. Model 路径配置 (用于 spd_scorer 和 spd_scorer_reward)
+    3. 分布式训练配置
+    """
     env = os.environ.copy()
-    env["SPD_REWARD_ALPHA"] = str(config.reward_alpha)
-    env["SPD_REWARD_PENALTY_BREAK"] = str(config.reward_penalty_break)
-    env["SPD_REWARD_CORRECT"] = str(config.reward_correct)
-    env["SPD_REWARD_USELESS"] = str(config.reward_useless)
-    if config.target_model_url:
-        env["SPD_TARGET_MODEL_URL"] = str(config.target_model_url)
-    if config.target_model_name:
-        env["SPD_TARGET_MODEL_NAME"] = str(config.target_model_name)
+    
+    # 1. Reward 配置
+    env["SPD_REWARD_ALPHA"] = str(args.reward_alpha)
+    env["SPD_REWARD_PENALTY_BREAK"] = str(args.reward_penalty_break)
+    env["SPD_REWARD_CORRECT"] = str(args.reward_correct)
+    env["SPD_REWARD_USELESS"] = str(args.reward_useless)
+    
+    # 2. 模型配置 (注入环境变量，供 spd_scorer.py 和 spd_scorer_reward.py 读取)
+    env["SPD_MODEL_PATH"] = str(args.model_path)
+    
+    # Target Model Path: 优先使用 target_model_path，如果没有指定，fallback 到 model_path
+    env["SPD_TARGET_MODEL_PATH"] = str(args.target_model_path)
+   
+        
+    env["SPD_LORA_RANK"] = str(args.lora_rank)
+    env["SPD_LORA_ALPHA"] = str(args.lora_alpha)
+    
+    # 3. 基础训练配置
+    env["HYDRA_FULL_ERROR"] = "1"
+    env["NCCL_P2P_DISABLE"] = "1"
+    
     return env
-
-
-# ==============================================================================
-# 4. 独立的 SPD Scorer 训练循环 (不依赖 verl 的 main_ppo)
-# ==============================================================================
-
-def train_spd_scorer_standalone(config: SPDTrainingConfig):
-    """
-    独立的 SPD Scorer 训练函数
-    
-    这个函数提供了一个不完全依赖 verl.trainer.main_ppo 的训练选项。
-    它直接使用 verl 的底层组件 (FSDP Engine, Optimizer 等) 来训练 SPD Scorer。
-    
-    适用场景:
-        - 需要更精细地控制训练流程
-        - SPD Scorer 的输出格式与标准 LLM 差异较大
-        - 需要自定义 rollout 逻辑
-    
-    Args:
-        config: 训练配置
-    """
-    logger.info("=" * 60)
-    logger.info("SPD Scorer 独立训练模式")
-    logger.info("=" * 60)
-    
-    # 导入必要的模块
-    try:
-        import torch
-        import torch.distributed as dist
-        from torch.utils.data import DataLoader
-        
-        # 导入 SPD Scorer
-        from spd_scorer import ScoringActor, ScoringModelConfig, SPDRewardFunction
-        
-        logger.info("成功导入 SPD Scorer 模块")
-    except ImportError as e:
-        logger.error(f"导入模块失败: {e}")
-        logger.info("请确保 spd_scorer.py 在当前目录")
-        return
-    
-    # 初始化分布式环境 (如果需要)
-    if not dist.is_initialized():
-        # 单机训练时，使用简单的初始化
-        if torch.cuda.is_available():
-            dist.init_process_group(backend='nccl', init_method='env://')
-        else:
-            logger.warning("CUDA 不可用，使用 CPU 训练")
-    
-    # 创建模型配置
-    model_config = ScoringModelConfig(
-        model_name_or_path=config.model_path,
-        lora_rank=config.lora_rank,
-        lora_alpha=config.lora_alpha,
-        target_modules=config.lora_target_modules,
-    )
-    
-    # 创建奖励函数
-    reward_fn = SPDRewardFunction(
-        alpha=config.reward_alpha,
-        penalty_break=config.reward_penalty_break,
-        reward_correct=config.reward_correct,
-        reward_useless=config.reward_useless,
-    )
-    
-    logger.info("\n模型配置:")
-    logger.info(f"  - 基础模型: {config.model_path}")
-    logger.info(f"  - LoRA Rank: {config.lora_rank}")
-    logger.info(f"  - LoRA Alpha: {config.lora_alpha}")
-    
-    logger.info("\n奖励配置:")
-    logger.info(f"  - Alpha (场景A): {config.reward_alpha}")
-    logger.info(f"  - Penalty Break (场景B): {config.reward_penalty_break}")
-    logger.info(f"  - Reward Correct (场景D): {config.reward_correct}")
-    logger.info(f"  - Reward Useless (场景C): {config.reward_useless}")
-    
-    # 这里只是一个框架示例
-    # 完整实现需要:
-    # 1. 加载数据
-    # 2. 初始化模型 (ScoringActor)
-    # 3. 实现 GRPO 训练循环
-    # 4. 保存模型
-    
-    logger.info("\n[注意] 独立训练模式需要更多实现工作")
-    logger.info("建议先使用 verl 集成模式 (run_training)")
-    logger.info("如果需要完整的独立训练循环，请参考 verl 的 trainer 实现")
 
 
 # ==============================================================================
@@ -589,29 +463,28 @@ def main():
     
     parser = argparse.ArgumentParser(description="SPD Scorer GRPO 训练")
     
-    parser.add_argument("--mode", type=str, default="verl", 
-                        choices=["verl", "standalone"],
-                        help="训练模式: verl (使用 verl 框架) 或 standalone (独立训练)")
-    
     # 模型配置
-    parser.add_argument("--model_path", type=str, default="meta-llama/Llama-3-8B",
-                        help="基础模型路径")
+    parser.add_argument("--model_path", type=str, default="meta-llama/Llama-3-8B", help="基础模型路径")
+    parser.add_argument("--target_model_path", type=str, default=None, help="Target 模型路径 (用于 Reward Tokenizer)")
     parser.add_argument("--lora_rank", type=int, default=16, help="LoRA Rank")
     parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA Alpha")
     
     # 数据配置
-    parser.add_argument("--data_dir", type=str, default="data/spd_scorer",
-                        help="数据目录")
-    parser.add_argument("--spd_gen_data_file", type=str, required=True,
-                        help="SPD 生成数据文件路径 (jsonl)")
-    parser.add_argument("--metadata_file", type=str, required=True,
-                        help="Metadata 文件路径 (jsonl)")
+    parser.add_argument("--data_dir", type=str, default="data/spd_scorer", help="数据目录")
+    parser.add_argument("--spd_gen_data_file", type=str, required=True, help="SPD 生成数据文件路径 (jsonl)")
+    parser.add_argument("--metadata_file", type=str, required=True, help="Metadata 文件路径 (jsonl)")
+    parser.add_argument("--overwrite_data", action="store_true", help="是否强制覆盖已存在的训练数据")
     
     # 训练配置
     parser.add_argument("--n_gpus", type=int, default=8, help="GPU 数量")
     parser.add_argument("--train_batch_size", type=int, default=64, help="训练批次大小")
     parser.add_argument("--rollout_n", type=int, default=8, help="GRPO Rollout N")
     parser.add_argument("--total_epochs", type=int, default=3, help="训练轮数")
+    parser.add_argument("--ppo_mini_batch_size", type=int, default=32, help="PPO mini batch 大小")
+    parser.add_argument("--micro_batch_size_per_gpu", type=int, default=4, help="每 GPU 微批次大小")
+    parser.add_argument("--offload", action="store_true", help="启用 FSDP CPU Offload (省显存但降低速度)")
+    parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.7, help="vLLM GPU 显存利用率")
+    parser.add_argument("--sep_token_id", type=str, default="eot", help="分隔符 Token ID (eot 或数字)")
     
     # 奖励配置
     parser.add_argument("--reward_alpha", type=float, default=1.0, help="场景A奖励系数")
@@ -619,61 +492,24 @@ def main():
     parser.add_argument("--reward_correct", type=float, default=100.0, help="场景D奖励")
     parser.add_argument("--reward_useless", type=float, default=0.0, help="场景C奖励")
     
-    # 补全服务
-    parser.add_argument("--target_model_url", type=str, default=None,
-                        help="Target Model vLLM API 地址 (e.g. http://localhost:8000/v1/completions)")
-    parser.add_argument("--target_model_name", type=str, default="target-model",
-                        help="Target Model 名称")
-    
     # 其他
     parser.add_argument("--no_wandb", action="store_true", help="禁用 WandB")
-    parser.add_argument("--project_name", type=str, default="verl_spd_scorer",
-                        help="WandB 项目名")
-    parser.add_argument("--experiment_name", type=str, default="spd_grpo_training",
-                        help="实验名")
+    parser.add_argument("--project_name", type=str, default="verl_spd_scorer", help="WandB 项目名")
+    parser.add_argument("--experiment_name", type=str, default="spd_grpo_training", help="实验名")
     
     args = parser.parse_args()
-    
-    # 创建配置
-    config = SPDTrainingConfig(
-        model_path=args.model_path,
-        data_dir=args.data_dir,
-        lora_rank=args.lora_rank,
-        lora_alpha=args.lora_alpha,
-        n_gpus=args.n_gpus,
-        train_batch_size=args.train_batch_size,
-        rollout_n=args.rollout_n,
-        total_epochs=args.total_epochs,
-        reward_alpha=args.reward_alpha,
-        reward_penalty_break=args.reward_penalty_break,
-        reward_correct=args.reward_correct,
-        reward_useless=args.reward_useless,
-        target_model_url=args.target_model_url,
-        target_model_name=args.target_model_name,
-        use_wandb=not args.no_wandb,
-        project_name=args.project_name,
-        experiment_name=args.experiment_name,
-    )
     
     # 打印配置
     logger.info("\n" + "=" * 60)
     logger.info("SPD Scorer 训练配置")
     logger.info("=" * 60)
-    logger.info(f"模式: {args.mode}")
-    logger.info(f"模型: {config.model_path}")
-    logger.info(f"LoRA: rank={config.lora_rank}, alpha={config.lora_alpha}")
-    logger.info(f"训练: {config.n_gpus} GPU, batch={config.train_batch_size}, epochs={config.total_epochs}")
-    logger.info(f"GRPO: rollout_n={config.rollout_n}")
-    logger.info(f"奖励: A={config.reward_alpha}*L, B={config.reward_penalty_break}, C={config.reward_useless}, D={config.reward_correct}")
+    for key, value in vars(args).items():
+        logger.info(f"{key}: {value}")
     logger.info("=" * 60 + "\n")
     
-    # 根据模式选择训练方法
     source_data_path = [args.spd_gen_data_file, args.metadata_file]
+    run_training(args, source_data_path)
     
-    if args.mode == "verl":
-        run_training(config, source_data_path)
-    else:
-        train_spd_scorer_standalone(config)
 
 
 if __name__ == "__main__":
