@@ -79,8 +79,8 @@ def prepare_spd_data_from_real_source(
         source_data_path: 包含两个文件路径的列表 [spd_gen_data_file, metadata_file]
     """
     # 1. 计算目标路径
-    train_file = getattr(args, "train_file", "train.parquet")
-    val_file = getattr(args, "val_file", "val.parquet")
+    train_file = args.train_file
+    val_file = args.val_file
     
     train_path = os.path.join(args.data_dir, train_file)
     val_path = os.path.join(args.data_dir, val_file)
@@ -170,16 +170,16 @@ def prepare_spd_data_from_real_source(
         draft_ids = row.get('draft_output_ids')
         target_ids = row.get('target_output_ids')
         
-        # 严格校验长度: 如果 Draft 和 Target 长度不一致，直接跳过
-        if len(draft_ids) != len(target_ids):
-            logger.warning(f"Sample {sample_idx} draft/target length mismatch ({len(draft_ids)} vs {len(target_ids)}). Skipping.")
+        # 严格校验长度: Target 应该比 Draft 多一个 bonus token
+        if len(target_ids) != len(draft_ids) + 1:
+            logger.warning(f"Sample {sample_idx} draft/target length mismatch: target ({len(target_ids)}) should be draft ({len(draft_ids)}) + 1. Skipping.")
             continue
         if len(draft_ids) == 0:
             logger.warning(f"Sample {sample_idx} draft length is 0. Skipping.")
             continue
             
         draft_len = len(draft_ids)
-        target_len = len(target_ids) # 应该等于 draft_len
+        target_len = len(target_ids) - 1  # 去掉 bonus token 后的长度，应该等于 draft_len
 
         # =================================================================
         # 构造完整的 Input IDs (用于 Actor 输入)
@@ -471,6 +471,8 @@ def main():
     
     # 数据配置
     parser.add_argument("--data_dir", type=str, default="data/spd_scorer", help="数据目录")
+    parser.add_argument("--train_file", type=str, default="train.parquet", help="训练数据文件名")
+    parser.add_argument("--val_file", type=str, default="val.parquet", help="验证数据文件名")
     parser.add_argument("--spd_gen_data_file", type=str, required=True, help="SPD 生成数据文件路径 (jsonl)")
     parser.add_argument("--metadata_file", type=str, required=True, help="Metadata 文件路径 (jsonl)")
     parser.add_argument("--overwrite_data", action="store_true", help="是否强制覆盖已存在的训练数据")
