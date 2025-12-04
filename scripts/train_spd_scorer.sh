@@ -13,16 +13,19 @@ set -e  # 遇到错误立即退出
 # ==============================================================================
 # 配置参数
 # ==============================================================================
+export HF_HOME=/wekafs/jinzeli2/cache
+export WANDB_API_KEY="88b970302b89c7b55c90532cfd69ce4ee64ba81a"
 
 # 模型配置
-MODEL_PATH="meta-llama/Llama-3.2-1B-Instruct"
+MODEL_PATH="meta-llama/Llama-3.1-8B-Instruct"
+TARGET_MODEL_PATH="meta-llama/Llama-3.1-70B-Instruct"
 LORA_RANK=16
 LORA_ALPHA=32
 
 # 数据配置
-DATA_DIR="data/spd_scorer"
-SPD_GEN_DATA_FILE="data/spd_gen_output.jsonl"
-METADATA_FILE="data/metadata.jsonl"
+DATA_DIR="/wekafs/jinzeli2/spec_boost/data"
+SPD_GEN_DATA_FILE="/wekafs/jinzeli2/spec_boost/data/251130_trainRL_0_8000.jsonl"
+METADATA_FILE="/wekafs/jinzeli2/spec_boost/data/correct_samples_default_withids.jsonl"
 
 # 训练配置
 N_GPUS=8
@@ -72,8 +75,10 @@ python train_spd_scorer.py \
     --reward_correct ${REWARD_CORRECT} \
     --reward_useless ${REWARD_USELESS} \
     --project_name ${PROJECT_NAME} \
-    --experiment_name ${EXPERIMENT_NAME}
-    # --target_model_path ""      # 可选: Target 模型路径
+    --experiment_name ${EXPERIMENT_NAME} \
+    --target_model_path ${TARGET_MODEL_PATH} \
+    --overwrite_data \
+    &> /wekafs/jinzeli2/spec_boost/log/251204_test1   
     # --overwrite_data            # 可选: 强制覆盖已存在的训练数据
     # --offload                   # 可选: 启用 FSDP CPU Offload
     # --no_wandb                  # 可选: 禁用 WandB
