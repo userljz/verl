@@ -188,7 +188,7 @@ def prepare_spd_data_from_real_source(
         
         # 获取 SEP Token ID (Llama-3 eot_id)
         if args.sep_token_id == "eot":
-            sep_token_id = tokenizer.eos_token_id if hasattr(tokenizer, "eos_token_id") else tokenizer.eot_token_id
+            sep_token_id = tokenizer.eos_token_id if hasattr(tokenizer, "eos_token_id") else tokenizer.eos_token_id
         else:
             raise ValueError(f"Invalid sep_token_id: {args.sep_token_id}")
         
@@ -452,8 +452,8 @@ def _create_training_env(args) -> Dict[str, str]:
         logger.info(f"解析 sep_token_id='eot'...")
         tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
         # 优先尝试 eot_id (Llama-3), 然后 eos_token_id
-        if hasattr(tokenizer, "eot_token_id") and tokenizer.eot_token_id is not None:
-            real_sep_id = tokenizer.eot_token_id
+        if hasattr(tokenizer, "eos_token_id") and tokenizer.eos_token_id is not None:
+            real_sep_id = tokenizer.eos_token_id
         
         else:
             raise ValueError(f"无法解析 sep_token_id: {args.sep_token_id}")
