@@ -28,7 +28,6 @@ from typing import Generator, List
 from verl import DataProto
 from verl.workers.rollout.base import BaseRollout
 from verl.workers.config import RolloutConfig
-from verl.utils.torch_functional import get_broadcast_tensor_from_0
 
 from spd_scorer import ScoringActor, ScoringModelConfig, parse_input_sequence
 
