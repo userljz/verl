@@ -445,7 +445,23 @@ def _create_training_env(args) -> Dict[str, str]:
         
     env["SPD_LORA_RANK"] = str(args.lora_rank)
     env["SPD_LORA_ALPHA"] = str(args.lora_alpha)
-    env["SPD_SEP_TOKEN_ID"] = str(args.sep_token_id)
+    
+    # 处理 SEP Token ID
+    # 如果是 "eot"，则尝试加载 tokenizer 解析，或者使用默认值
+    if str(args.sep_token_id).lower() == "eot":
+        logger.info(f"解析 sep_token_id='eot'...")
+        tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+        # 优先尝试 eot_id (Llama-3), 然后 eos_token_id
+        if hasattr(tokenizer, "eot_token_id") and tokenizer.eot_token_id is not None:
+            real_sep_id = tokenizer.eot_token_id
+        
+        else:
+            raise ValueError(f"无法解析 sep_token_id: {args.sep_token_id}")
+        logger.info(f"已解析 sep_token_id: eot -> {real_sep_id}")
+        env["SPD_SEP_TOKEN_ID"] = str(real_sep_id)
+        
+    else:
+        raise ValueError(f"Invalid sep_token_id: {args.sep_token_id}")
     
     # 3. 基础训练配置
     env["HYDRA_FULL_ERROR"] = "1"
