@@ -311,7 +311,7 @@ def build_training_command(args, train_file: str, val_file: str) -> list:
         "data.custom_cls.name=SPDRLHFDataset",
         
         f"data.train_batch_size={args.train_batch_size}",
-        "data.max_prompt_length=2048",         # 包含 Context + Draft + Target
+        "data.max_prompt_length=4096",         # 包含 Context + Draft + Target
         "data.max_response_length=50",        # 输出是 Accept/Reject 决策序列
         
         # =================================================================

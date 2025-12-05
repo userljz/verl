@@ -77,7 +77,6 @@ python train_spd_scorer.py \
     --project_name ${PROJECT_NAME} \
     --experiment_name ${EXPERIMENT_NAME} \
     --target_model_path ${TARGET_MODEL_PATH} \
-    --overwrite_data \
     &> /wekafs/jinzeli2/spec_boost/log/251204_test1   
     # --overwrite_data            # 可选: 强制覆盖已存在的训练数据
     # --offload                   # 可选: 启用 FSDP CPU Offload
