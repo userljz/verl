@@ -29,7 +29,7 @@ from verl import DataProto
 from verl.workers.rollout.base import BaseRollout
 from verl.workers.config import RolloutConfig
 
-from spd_scorer import ScoringActor, ScoringModelConfig, parse_input_sequence
+from spd_scorer import ScoringActor, ScoringModelConfig
 
 class SPDRollout(BaseRollout):
     def __init__(self, config: RolloutConfig, model_config, device_mesh):
