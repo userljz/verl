@@ -104,6 +104,17 @@ class SPDRollout(BaseRollout):
         attention_mask = prompts.batch['attention_mask']
         batch_size = idx.shape[0]
         
+        # DEBUG: 打印键值并退出，用于调试
+        print(f"DEBUG: prompts.batch keys: {list(prompts.batch.keys())}")
+        print(f"DEBUG: prompts.non_tensor_batch keys: {list(prompts.non_tensor_batch.keys())}")
+        
+        # 为了查看内容，也可以打印一下非 tensor 的第一个元素
+        # if len(prompts.non_tensor_batch) > 0:
+        #     first_key = list(prompts.non_tensor_batch.keys())[0]
+        #     print(f"DEBUG: sample non_tensor_batch['{first_key}']: {prompts.non_tensor_batch[first_key]}")
+
+        raise ValueError("DEBUG: Interrupted for inspection.")
+
         # 解析输入序列以获取 Draft 和 Target Tokens
         # 我们直接从 prompts.non_tensor_batch['extra_info'] 中获取这些信息
         # 注意: extra_info 是一个 object array，每个元素是一个 dict
