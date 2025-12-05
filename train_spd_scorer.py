@@ -306,8 +306,8 @@ def build_training_command(args, train_file: str, val_file: str) -> list:
         f"data.train_files={train_file}",
         f"data.val_files={val_file}",
         
-        # 使用自定义的 SPD Dataset
-        "data.custom_cls.path=verl.utils.dataset.spd_dataset",
+        # 使用自定义的 SPD Dataset（通过 pkg:// 按模块导入）
+        "data.custom_cls.path=pkg://verl.utils.dataset.spd_dataset",
         "data.custom_cls.name=SPDRLHFDataset",
         
         f"data.train_batch_size={args.train_batch_size}",
