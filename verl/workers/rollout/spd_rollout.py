@@ -23,6 +23,7 @@ SPD Rollout: Speculative Decoding Scorer 的专用 Rollout 实现
 
 import torch
 import torch.distributed
+import os
 from typing import Generator, List
 
 from verl import DataProto
@@ -44,9 +45,20 @@ class SPDRollout(BaseRollout):
         
         # 创建模型实例 (这里假设模型结构与 spd_scorer.py 中定义的一致)
         # 实际运行时，权重会通过 update_weights 加载
+        
+        # 从环境变量获取 SPD 特定配置
+        lora_rank = int(os.getenv("SPD_LORA_RANK", "16"))
+        lora_alpha = int(os.getenv("SPD_LORA_ALPHA", "32"))
+        # 获取 SEP token ID (如果是 "eot" 或其他非数字字符串，后续逻辑可能需要调整，这里假设传进来的是数字字符串或 eot)
+        # 注意: ScoringModelConfig 期望 sep_token_id 是 int
+        sep_token_id_str = os.getenv("SPD_SEP_TOKEN_ID", "128009")
+        sep_token_id = int(sep_token_id_str)
+        
         spd_config = ScoringModelConfig(
-            model_name_or_path=model_config.model_path,
-            # 其他参数从 config 获取
+            model_name_or_path=model_config.path,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            sep_token_id=sep_token_id
         )
         self.model = ScoringActor(spd_config)
         self.model.to(self.device)

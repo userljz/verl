@@ -445,6 +445,7 @@ def _create_training_env(args) -> Dict[str, str]:
         
     env["SPD_LORA_RANK"] = str(args.lora_rank)
     env["SPD_LORA_ALPHA"] = str(args.lora_alpha)
+    env["SPD_SEP_TOKEN_ID"] = str(args.sep_token_id)
     
     # 3. 基础训练配置
     env["HYDRA_FULL_ERROR"] = "1"
