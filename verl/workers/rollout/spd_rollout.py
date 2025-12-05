@@ -104,34 +104,38 @@ class SPDRollout(BaseRollout):
         attention_mask = prompts.batch['attention_mask']
         batch_size = idx.shape[0]
         
-        # DEBUG: 打印键值并退出，用于调试
-        print(f"DEBUG: prompts.batch keys: {list(prompts.batch.keys())}")
-        print(f"DEBUG: prompts.non_tensor_batch keys: {list(prompts.non_tensor_batch.keys())}")
+        # 从 rollout_info 获取信息 (这是我们在 train_spd_scorer.py 中显式透传的)
+        if 'rollout_info' not in prompts.non_tensor_batch:
+             raise KeyError(f"'rollout_info' not found in non_tensor_batch. Available keys: {list(prompts.non_tensor_batch.keys())}")
+             
+        rollout_infos = prompts.non_tensor_batch['rollout_info']
         
-        # 为了查看内容，也可以打印一下非 tensor 的第一个元素
-        # if len(prompts.non_tensor_batch) > 0:
-        #     first_key = list(prompts.non_tensor_batch.keys())[0]
-        #     print(f"DEBUG: sample non_tensor_batch['{first_key}']: {prompts.non_tensor_batch[first_key]}")
-
-        raise ValueError("DEBUG: Interrupted for inspection.")
-
-        # 解析输入序列以获取 Draft 和 Target Tokens
-        # 我们直接从 prompts.non_tensor_batch['extra_info'] 中获取这些信息
-        # 注意: extra_info 是一个 object array，每个元素是一个 dict
-        extra_infos = prompts.non_tensor_batch['extra_info']
-        
-        draft_tokens_list = [info['draft_tokens'] for info in extra_infos]
-        target_tokens_list = [info['target_tokens'] for info in extra_infos]
+        draft_tokens_list = [info['draft_tokens'] for info in rollout_infos]
+        target_tokens_list = [info['target_tokens'] for info in rollout_infos]
         
         # 转换为 Tensor
-        draft_tokens = torch.tensor(draft_tokens_list, device=self.device, dtype=torch.long)
-        target_tokens = torch.tensor(target_tokens_list, device=self.device, dtype=torch.long)
+        # 注意: 如果不同样本 draft 长度不一致，需要 padding 到最大长度
+        # 但 verl 框架通常会处理 batch 使得长度可控，这里我们先假设同一 batch 内 draft tokens 长度一致
+        # 如果不一致，使用嵌套 tensor 或 padding
+        
+        # 假设数据集构造保证了同一 batch 内 (甚至全局) draft_len 一致，或者直接取当前 batch 的长度
+        # 且 draft_len 已在 rollout_info 中透传
+        draft_len = rollout_infos[0]['draft_len']
+        
+        # 构造 Tensor (无 Padding)
+        draft_tokens = torch.zeros((batch_size, draft_len), dtype=torch.long, device=self.device)
+        target_tokens = torch.zeros((batch_size, draft_len), dtype=torch.long, device=self.device)
+        
+        for i in range(batch_size):
+            draft_tokens[i] = torch.tensor(draft_tokens_list[i], device=self.device)
+            target_tokens[i] = torch.tensor(target_tokens_list[i], device=self.device)
         
         # 获取位置索引
-        draft_start_idx = torch.tensor([info['draft_start_idx'] for info in extra_infos], device=self.device, dtype=torch.long)
-        draft_end_idx = torch.tensor([info['draft_end_idx'] for info in extra_infos], device=self.device, dtype=torch.long)
+        draft_start_idx = torch.tensor([info['draft_start_idx'] for info in rollout_infos], device=self.device, dtype=torch.long)
+        draft_end_idx = torch.tensor([info['draft_end_idx'] for info in rollout_infos], device=self.device, dtype=torch.long)
         
         # 计算 Match Mask: [Batch, Draft_Len]
+        # 无需处理 Padding
         match_mask = (draft_tokens == target_tokens).to(self.device)
         
         # 2. 模型前向传播

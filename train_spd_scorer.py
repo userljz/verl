@@ -254,6 +254,16 @@ def prepare_spd_data_from_real_source(
                 "draft_end_idx": draft_end_idx,
                 "target_start_idx": target_start_idx,
                 "target_end_idx": target_end_idx,
+            },
+            # [Fix] 复制一份到 rollout_info 以避开 RayTrainer 对 extra_info 的过滤，确保透传给 Rollout
+            "rollout_info": {
+                "draft_tokens": draft_ids,
+                "target_tokens": target_ids[:-1],
+                "draft_start_idx": draft_start_idx,
+                "draft_end_idx": draft_end_idx,
+                "target_start_idx": target_start_idx,
+                "target_end_idx": target_end_idx,
+                "draft_len": draft_len,
             }
         }
         processed_data.append(sample)
