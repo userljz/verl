@@ -1,7 +1,7 @@
 #!/bin/bash
 
 export CUDA_VISIBLE_DEVICES=0,1,2,3
-export LOGURU_LEVEL=DEBUG  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+export LOGURU_LEVEL=INFO  # DEBUG, INFO, WARNING, ERROR, CRITICAL
 set -e  # 遇到错误立即退出
 
 # ==============================================================================
@@ -40,7 +40,7 @@ METADATA_FILE="/wekafs/jinzeli2/spec_boost/data/correct_samples_default_withids.
 # 训练配置
 N_GPUS=4                                                        # 使用的 GPU 数量
 TRAIN_BATCH_SIZE=64                                             # 全局 batch size
-ROLLOUT_N=2                                                    # 每个 step 生成的 rollout 数
+ROLLOUT_N=4                                                    # 每个 step 生成的 rollout 数
 TOTAL_EPOCHS=2                                                  # 训练轮数
 PPO_MINI_BATCH_SIZE=64                                           # PPO 小批次大小
 micro_batch_size_per_gpu=16
@@ -53,14 +53,12 @@ REWARD_PENALTY_BREAK=-5.0                                       # 场景B惩罚:
 REWARD_CORRECT_BASE=5.0                                         # 场景D基础奖励: 纠正错误的基础分
 REWARD_USELESS=0.0                                              # 场景C奖励: 无用尝试 (原本错，Hybrid也错)
 
-# vLLM 服务器配置（多服务器负载均衡）
-# 每个 GPU 对应一个 vLLM 服务器，减少单服务器压力
-# 格式: 逗号分隔的 URL 列表，数量应与 N_GPUS 一致
 export SPD_VLLM_URLS="http://localhost:8000/v1/completions,http://localhost:8001/v1/completions,http://localhost:8002/v1/completions,http://localhost:8003/v1/completions"
+
 
 # 日志配置
 PROJECT_NAME="verl_spd_scorer"                                  # WandB 项目名
-EXPERIMENT_NAME="251223exp1"                             # 实验名称
+EXPERIMENT_NAME="251224exp1"                             # 实验名称
 
 # ==============================================================================
 # 启动训练
@@ -95,7 +93,6 @@ python train_spd_scorer.py \
     --reward_useless ${REWARD_USELESS} \
     --project_name ${PROJECT_NAME} \
     --experiment_name ${EXPERIMENT_NAME} \
-    --no_wandb \
     &> /wekafs/jinzeli2/spec_boost/log/${EXPERIMENT_NAME}   
     # --offload                   # 可选: 启用 FSDP CPU Offload
     # --no_wandb \                 # 可选: 禁用 WandB

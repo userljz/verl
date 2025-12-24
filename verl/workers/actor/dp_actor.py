@@ -21,6 +21,7 @@ import logging
 import os
 
 import torch
+from loguru import logger as loguru_logger  # 添加 loguru 用于调试日志
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.tensor import DTensor
@@ -361,6 +362,13 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_module.train()
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid silent error
+        
+        # ==================== DEBUG: Actor Update 开始 ====================
+        loguru_logger.debug("=" * 60)
+        loguru_logger.debug("[Actor Update Policy] 开始更新")
+        loguru_logger.debug(f"[Actor Update Policy] batch_size: {data.batch.batch_size[0]}")
+        loguru_logger.debug(f"[Actor Update Policy] temperature: {temperature}")
+        loguru_logger.debug(f"[Actor Update Policy] batch keys: {list(data.batch.keys())}")
 
         select_keys = [
             "responses",
@@ -403,13 +411,22 @@ class DataParallelPPOActor(BasePPOActor):
 
                 self.actor_optimizer.zero_grad()
 
-                for micro_batch in micro_batches:
+                for micro_batch_idx, micro_batch in enumerate(micro_batches):
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
                     response_mask = model_inputs["response_mask"]
                     old_log_prob = model_inputs["old_log_probs"]
                     advantages = model_inputs["advantages"]
+                    
+                    # ==================== DEBUG: Micro Batch 信息 ====================
+                    loguru_logger.debug(f"[Actor Micro Batch {micro_batch_idx}] 处理中...")
+                    loguru_logger.debug(f"  - response_mask shape: {response_mask.shape}")
+                    loguru_logger.debug(f"  - response_mask 有效 token 数: {response_mask.sum().item():.0f}")
+                    loguru_logger.debug(f"  - old_log_prob shape: {old_log_prob.shape}")
+                    loguru_logger.debug(f"  - old_log_prob 统计: min={old_log_prob.min().item():.4f}, max={old_log_prob.max().item():.4f}, mean={old_log_prob.mean().item():.4f}")
+                    loguru_logger.debug(f"  - advantages shape: {advantages.shape}")
+                    loguru_logger.debug(f"  - advantages 统计: min={advantages.min().item():.4f}, max={advantages.max().item():.4f}, mean={advantages.mean().item():.4f}, std={advantages.std().item():.4f}")
 
                     entropy_coeff = self.config.entropy_coeff
                     loss_agg_mode = self.config.loss_agg_mode
@@ -426,6 +443,16 @@ class DataParallelPPOActor(BasePPOActor):
                     entropy, log_prob = self._forward_micro_batch(
                         model_inputs, temperature=temperature, calculate_entropy=calculate_entropy
                     )
+                    
+                    # ==================== DEBUG: 当前模型 Log Prob ====================
+                    loguru_logger.debug(f"  - 当前 log_prob shape: {log_prob.shape}")
+                    loguru_logger.debug(f"  - 当前 log_prob 统计: min={log_prob.min().item():.4f}, max={log_prob.max().item():.4f}, mean={log_prob.mean().item():.4f}")
+                    
+                    # 计算 log_prob 差异 (用于观察策略偏移)
+                    log_prob_diff = (log_prob - old_log_prob).abs()
+                    masked_diff = log_prob_diff * response_mask
+                    avg_diff = masked_diff.sum() / (response_mask.sum() + 1e-8)
+                    loguru_logger.debug(f"  - |log_prob - old_log_prob| 平均差异: {avg_diff.item():.4f}")
 
                     # for fully_async_policy recipe
                     if hasattr(self.config, "use_rollout_log_probs") and self.config.use_rollout_log_probs:
@@ -463,12 +490,20 @@ class DataParallelPPOActor(BasePPOActor):
                         rollout_is_weights=rollout_is_weights,
                     )
                     micro_batch_metrics.update(pg_metrics)
+                    
+                    # ==================== DEBUG: Policy Loss 信息 ====================
+                    loguru_logger.debug(f"  - Policy Loss (PG Loss): {pg_loss.item():.6f}")
+                    loguru_logger.debug(f"  - PG Metrics: {pg_metrics}")
 
                     if entropy_coeff != 0:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
 
                         # compute policy loss
                         policy_loss = pg_loss - entropy_loss * entropy_coeff
+                        
+                        # ==================== DEBUG: Entropy Loss ====================
+                        loguru_logger.debug(f"  - Entropy Loss: {entropy_loss.item():.6f}")
+                        loguru_logger.debug(f"  - Entropy Coeff: {entropy_coeff}")
                     else:
                         policy_loss = pg_loss
 
@@ -483,6 +518,10 @@ class DataParallelPPOActor(BasePPOActor):
                         policy_loss = policy_loss + kl_loss * self.config.kl_loss_coef
                         micro_batch_metrics["actor/kl_loss"] = kl_loss.detach().item() * loss_scale_factor
                         micro_batch_metrics["actor/kl_coef"] = self.config.kl_loss_coef
+                        
+                        # ==================== DEBUG: KL Loss ====================
+                        loguru_logger.debug(f"  - KL Loss: {kl_loss.item():.6f}")
+                        loguru_logger.debug(f"  - KL Coeff: {self.config.kl_loss_coef}")
 
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
@@ -490,6 +529,11 @@ class DataParallelPPOActor(BasePPOActor):
                     else:
                         loss = policy_loss * loss_scale_factor
                     loss.backward()
+                    
+                    # ==================== DEBUG: 最终 Loss ====================
+                    loguru_logger.debug(f"  - Final Policy Loss: {policy_loss.item():.6f}")
+                    loguru_logger.debug(f"  - Loss Scale Factor: {loss_scale_factor:.4f}")
+                    loguru_logger.debug(f"  - Scaled Loss (backward): {loss.item():.6f}")
 
                     micro_batch_metrics["actor/pg_loss"] = pg_loss.detach().item() * loss_scale_factor
                     append_to_dict(metrics, micro_batch_metrics)
@@ -497,5 +541,8 @@ class DataParallelPPOActor(BasePPOActor):
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
+                
+                # ==================== INFO: 关键训练指标汇总 ====================
+                loguru_logger.info(f"[Actor] MiniBatch {batch_idx} | GradNorm={grad_norm.item():.4f} | PGLoss={pg_loss.item():.4f} | AdvMean={advantages.mean().item():.4f} AdvStd={advantages.std().item():.4f}")
         self.actor_optimizer.zero_grad()
         return metrics

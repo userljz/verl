@@ -76,6 +76,7 @@ class BatchRewardManager(AbstractRewardManager):
             prompt_ids=prompt_ids,
             response_ids=response_ids,
             attention_mask=attention_mask,
+            batch_tensors=data.batch,  # Pass full batch for custom reward functions
             **self.reward_kwargs,
         )
 

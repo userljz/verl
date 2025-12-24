@@ -19,6 +19,7 @@ import subprocess
 from typing import Optional, Dict, List, Tuple
 
 import torch
+import torch.distributed as dist
 import pandas as pd
 from loguru import logger
 
@@ -26,6 +27,25 @@ from transformers import AutoTokenizer
 
 # 确保当前目录在 sys.path 中
 sys.path.insert(0, os.getcwd())
+
+
+
+def setup_loguru_rank0(log_file):
+    logger.remove()
+
+    def _filter(record):
+        # WARNING/ERROR 全 rank 输出；DEBUG/INFO 只 rank0 输出
+        if record["level"].no >= 30:
+            return True
+        return (not dist.is_initialized()) or dist.get_rank() == 0
+
+    level = os.getenv("LOGURU_LEVEL", "INFO")
+
+    # logger.add(sys.stderr, level=level, filter=_filter)
+    logger.add(log_file, level=level, filter=_filter)
+
+    return level
+
 
 # ==============================================================================
 # Monkey Patch: 注册 SPD Scorer 模型
@@ -102,8 +122,10 @@ def prepare_spd_data_from_real_source(
     logger.info(f"Metadata File: {meta_file}")
     
     # 加载 Tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
-    logger.info(f"Tokenizer 加载成功: {args.model_path}")
+    # 注意: 基础模型没有 chat_template，需要使用 Instruct 版本的 tokenizer
+    tokenizer_path = args.tokenizer_path if args.tokenizer_path else args.model_path
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+    logger.info(f"Tokenizer 加载成功: {tokenizer_path}")
     
     # 1. 加载 Metadata 到内存字典 (Index -> Data)
     logger.info("加载 Metadata...")
@@ -119,6 +141,7 @@ def prepare_spd_data_from_real_source(
     
     os.makedirs(args.data_dir, exist_ok=True)
     processed_data = []
+    skipped_same_count = 0  # 统计 draft_ids == target_ids[:-1] 被跳过的数量
     
     for idx, row in spd_gen_df.iterrows():
         if idx % 1000 == 0:
@@ -176,6 +199,11 @@ def prepare_spd_data_from_real_source(
             continue
         if len(draft_ids) == 0:
             logger.warning(f"Sample {sample_idx} draft length is 0. Skipping.")
+            continue
+        
+        # [New] 跳过 draft_ids 和 target_ids[:-1] 完全相同的样本（无学习价值）
+        if draft_ids == target_ids[:-1]:
+            skipped_same_count += 1
             continue
             
         draft_len = len(draft_ids)
@@ -257,6 +285,7 @@ def prepare_spd_data_from_real_source(
             },
             # [Fix] 复制一份到 rollout_info 以避开 RayTrainer 对 extra_info 的过滤，确保透传给 Rollout
             "rollout_info": {
+                "context_ids": context_ids,
                 "draft_tokens": draft_ids,
                 "target_tokens": target_ids[:-1],
                 "draft_start_idx": draft_start_idx,
@@ -264,13 +293,14 @@ def prepare_spd_data_from_real_source(
                 "target_start_idx": target_start_idx,
                 "target_end_idx": target_end_idx,
                 "draft_len": draft_len,
+                "ground_truth": ground_truth,  # 新增: 确保 GT 能透传到 Rollout
             }
         }
         processed_data.append(sample)
     
     # 保存
     df = pd.DataFrame(processed_data)
-    train_size = int(len(df) * 0.95)
+    train_size = int(len(df) * 0.99)
     train_df = df.iloc[:train_size]
     val_df = df.iloc[train_size:]
     
@@ -278,6 +308,7 @@ def prepare_spd_data_from_real_source(
     val_df.to_parquet(val_path)
     
     logger.info(f"处理完成: 训练集 {len(train_df)} 条, 验证集 {len(val_df)} 条")
+    logger.info(f"统计: 跳过 draft==target 的样本数: {skipped_same_count}, 有效数据总数: {len(processed_data)}")
     
     return train_path, val_path
 
@@ -286,7 +317,7 @@ def prepare_spd_data_from_real_source(
 # 3. 训练主函数
 # ==============================================================================
 
-def build_training_command(args, train_file: str, val_file: str) -> list:
+def build_training_command(args, train_file: str, val_file: str, real_sep_id: str) -> list:
     """
     构建 verl GRPO 训练命令
     
@@ -321,7 +352,8 @@ def build_training_command(args, train_file: str, val_file: str) -> list:
         "data.custom_cls.name=SPDRLHFDataset",
         
         f"data.train_batch_size={args.train_batch_size}",
-        "data.max_prompt_length=4096",         # 包含 Context + Draft + Target
+        f"data.val_batch_size={args.train_batch_size}",
+        f"data.max_prompt_length={args.max_prompt_length}",         # 包含 Context + Draft + Target
         "data.max_response_length=50",        # 输出是 Accept/Reject 决策序列
         
         # =================================================================
@@ -337,13 +369,15 @@ def build_training_command(args, train_file: str, val_file: str) -> list:
         # =================================================================
         # Rollout 配置
         # =================================================================
+        # [Fix] 让 RayTrainer 处理 rollout_n 的扩展 (repeat)，确保 batch size 一致
+        # 同时将 SPD_ROLLOUT_N 设为 1 (在 _create_training_env 中)，使 spd_rollout 只做 1-to-1 生成
         f"actor_rollout_ref.rollout.n={args.rollout_n}",
+        f"actor_rollout_ref.rollout.val_kwargs.n={args.rollout_n}",
         "actor_rollout_ref.rollout.name=spd",  # 使用自定义的 SPD Rollout
-        f"actor_rollout_ref.rollout.gpu_memory_utilization={args.vllm_gpu_memory_utilization}",
         "actor_rollout_ref.rollout.free_cache_engine=False",
-        f"actor_rollout_ref.rollout.data_parallel_size={args.n_gpus}",
+        f"actor_rollout_ref.rollout.data_parallel_size=1",
         "actor_rollout_ref.rollout.enforce_eager=True",
-        "actor_rollout_ref.rollout.tensor_model_parallel_size=1",
+        f"actor_rollout_ref.rollout.tensor_model_parallel_size=1",
         "actor_rollout_ref.rollout.enable_chunked_prefill=False",
         "actor_rollout_ref.rollout.max_num_batched_tokens=8192",
         f"actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu={args.micro_batch_size_per_gpu}",
@@ -372,8 +406,9 @@ def build_training_command(args, train_file: str, val_file: str) -> list:
         "trainer.nnodes=1",
         f"trainer.project_name={args.project_name}",
         f"trainer.experiment_name={args.experiment_name}",
-        "trainer.test_freq=10",
-        "trainer.save_freq=-1",
+        "trainer.test_freq=1000",  # 每 100 步验证一次（原来是 10 步太频繁）
+        "trainer.save_freq=500",  # 每 500 步保存一次模型
+        "trainer.val_before_train=False",  # 跳过初始验证，加快训练启动
     ]
     
     # 日志配置
@@ -407,7 +442,21 @@ def run_training(args, source_data_path: List[str]):
     
     # Step 2: 构建训练命令
     logger.info("\n[Step 2] 构建训练命令...")
-    cmd = build_training_command(args, train_file, val_file)
+    
+    # 获取 real_sep_id (从环境变量中读取，因为 _create_training_env 已经计算过了)
+    # 但 build_training_command 需要显式传入
+    # 为了简化，我们在这里重新解析一次，或者重构代码。
+    # 重构: 让 _create_training_env 返回 env，同时我们也需要 valid sep id for cmd
+    
+    # 简单的做法: 将解析逻辑提前到 main 或 run_training 开头
+    # 这里我们简单复制一下解析逻辑 (虽然有点重复)
+    real_sep_id = args.sep_token_id
+    if str(args.sep_token_id).lower() == "eot":
+         tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+         if hasattr(tokenizer, "eos_token_id") and tokenizer.eos_token_id is not None:
+            real_sep_id = str(tokenizer.eos_token_id)
+    
+    cmd = build_training_command(args, train_file, val_file, real_sep_id)
     
     logger.info("\n训练命令:")
     logger.info(" ".join(cmd[:5]) + " \\")
@@ -417,7 +466,6 @@ def run_training(args, source_data_path: List[str]):
     # Step 3: 执行训练
     logger.info("\n[Step 3] 启动训练...")
     logger.info("=" * 60)
-    
     logger.info(f"🚀 开始 SPD Scorer GRPO 训练")
     logger.info(f"配置: {args.n_gpus} GPU | Batch={args.train_batch_size} | Rollout N={args.rollout_n} | Offload={'ON' if args.offload else 'OFF'}")
     logger.info("=" * 60)
@@ -443,7 +491,7 @@ def _create_training_env(args) -> Dict[str, str]:
     # 1. Reward 配置
     env["SPD_REWARD_ALPHA"] = str(args.reward_alpha)
     env["SPD_REWARD_PENALTY_BREAK"] = str(args.reward_penalty_break)
-    env["SPD_REWARD_CORRECT"] = str(args.reward_correct)
+    env["SPD_REWARD_CORRECT_BASE"] = str(args.reward_correct_base)
     env["SPD_REWARD_USELESS"] = str(args.reward_useless)
     
     # 2. 模型配置 (注入环境变量，供 spd_scorer.py 和 spd_scorer_reward.py 读取)
@@ -453,11 +501,16 @@ def _create_training_env(args) -> Dict[str, str]:
     env["SPD_TARGET_MODEL_PATH"] = str(args.target_model_path)
    
         
+    env["SPD_ADAPTER_PATH"] = str(args.adapter_path)
     env["SPD_LORA_RANK"] = str(args.lora_rank)
     env["SPD_LORA_ALPHA"] = str(args.lora_alpha)
+    env["SPD_LORA_DROPOUT"] = str(args.lora_dropout)
+    env["SPD_TARGET_MODULES"] = str(args.target_modules)
+    # SPD_ROLLOUT_N 已移除，spd_rollout.py 内部固定为 1，由 RayTrainer 负责外部扩展
     
     # 处理 SEP Token ID
     # 如果是 "eot"，则尝试加载 tokenizer 解析，或者使用默认值
+    real_sep_id = None
     if str(args.sep_token_id).lower() == "eot":
         logger.info(f"解析 sep_token_id='eot'...")
         tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
@@ -471,11 +524,15 @@ def _create_training_env(args) -> Dict[str, str]:
         env["SPD_SEP_TOKEN_ID"] = str(real_sep_id)
         
     else:
-        raise ValueError(f"Invalid sep_token_id: {args.sep_token_id}")
+        env["SPD_SEP_TOKEN_ID"] = str(args.sep_token_id)
+        real_sep_id = args.sep_token_id
     
     # 3. 基础训练配置
     env["HYDRA_FULL_ERROR"] = "1"
     env["NCCL_P2P_DISABLE"] = "1"
+    
+    # 4. 日志配置 (传递给 spd_rollout.py，确保 Ray worker 也能写入同一个日志文件)
+    env["SPD_LOG_FILE"] = f"/wekafs/jinzeli2/spec_boost/log/{args.experiment_name}.log"
     
     return env
 
@@ -492,9 +549,13 @@ def main():
     
     # 模型配置
     parser.add_argument("--model_path", type=str, default="meta-llama/Llama-3-8B", help="基础模型路径")
+    parser.add_argument("--adapter_path", type=str, default=None, help="Peft Adapter 路径")
     parser.add_argument("--target_model_path", type=str, default=None, help="Target 模型路径 (用于 Reward Tokenizer)")
+    parser.add_argument("--tokenizer_path", type=str, default=None, help="Tokenizer 路径 (默认使用 model_path，基础模型需指定 Instruct 版本)")
     parser.add_argument("--lora_rank", type=int, default=16, help="LoRA Rank")
     parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA Alpha")
+    parser.add_argument("--lora_dropout", type=float, default=0.0, help="LoRA Dropout")
+    parser.add_argument("--target_modules", type=str, default="all", help="LoRA Target Modules")
     
     # 数据配置
     parser.add_argument("--data_dir", type=str, default="data/spd_scorer", help="数据目录")
@@ -511,14 +572,14 @@ def main():
     parser.add_argument("--total_epochs", type=int, default=3, help="训练轮数")
     parser.add_argument("--ppo_mini_batch_size", type=int, default=32, help="PPO mini batch 大小")
     parser.add_argument("--micro_batch_size_per_gpu", type=int, default=4, help="每 GPU 微批次大小")
+    parser.add_argument("--max_prompt_length", type=int, default=1024, help="最大 Prompt 长度 (只保留最后 N 个 token)")
     parser.add_argument("--offload", action="store_true", help="启用 FSDP CPU Offload (省显存但降低速度)")
-    parser.add_argument("--vllm_gpu_memory_utilization", type=float, default=0.7, help="vLLM GPU 显存利用率")
     parser.add_argument("--sep_token_id", type=str, default="eot", help="分隔符 Token ID (eot 或数字)")
     
     # 奖励配置
     parser.add_argument("--reward_alpha", type=float, default=1.0, help="场景A奖励系数")
     parser.add_argument("--reward_penalty_break", type=float, default=-10.0, help="场景B惩罚")
-    parser.add_argument("--reward_correct", type=float, default=100.0, help="场景D奖励")
+    parser.add_argument("--reward_correct_base", type=float, default=5.0, help="场景D基础奖励 (纠正错误时的基础分，实际奖励 = base + alpha * L)")
     parser.add_argument("--reward_useless", type=float, default=0.0, help="场景C奖励")
     
     # 其他
@@ -527,10 +588,11 @@ def main():
     parser.add_argument("--experiment_name", type=str, default="spd_grpo_training", help="实验名")
     
     args = parser.parse_args()
-    
+    level = setup_loguru_rank0(f"/wekafs/jinzeli2/spec_boost/log/{args.experiment_name}.log")
+
     # 打印配置
     logger.info("\n" + "=" * 60)
-    logger.info("SPD Scorer 训练配置")
+    logger.info(f"SPD Scorer 训练配置 ({level})")
     logger.info("=" * 60)
     for key, value in vars(args).items():
         logger.info(f"{key}: {value}")

@@ -15,7 +15,7 @@ Speculative Decoding Scoring Model (SPD Scorer)
 
 import os
 import math
-import logging
+from loguru import logger
 from typing import Optional, Tuple, Dict, List, Any, Union
 from dataclasses import dataclass
 
@@ -23,10 +23,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Bernoulli
+from transformers import AutoModelForCausalLM, AutoConfig
+from peft import PeftModel
 
-# ==============================================================================
-# 1. 数据结构定义
-# ==============================================================================
 
 @dataclass
 class ScoringModelConfig:
@@ -35,50 +34,34 @@ class ScoringModelConfig:
     
     Attributes:
         model_name_or_path: 基础模型路径 (如 meta-llama/Llama-3-8B)
+        adapter_path: Peft Adapter 路径 (包含 adapter_model.safetensors 和 adapter_config.json)
         hidden_size: 隐藏层维度 (Llama-3-8B 默认 4096)
-        score_head_hidden_size: Score Head 中间层维度 (默认 hidden_size // 4)
         sep_token_id: 分隔符 Token ID
-        lora_rank: LoRA 秩
-        lora_alpha: LoRA alpha 系数
-        lora_dropout: LoRA Dropout
-        target_modules: LoRA 目标模块列表
         mismatch_logit_value: 用于 Match 位置的强制 logit 值
     """
     model_name_or_path: str = "meta-llama/Llama-3-8B"
+    adapter_path: Optional[str] = None
     hidden_size: int = 4096
-    score_head_hidden_size: Optional[int] = None  # 默认 hidden_size // 4
-    sep_token_id: int = 128009  # Llama-3 的 <|eot_id|> token，可根据实际情况调整
-    lora_rank: int = 16
-    lora_alpha: int = 32
-    lora_dropout: float = 0.05
-    target_modules: List[str] = None  # 默认 ["q_proj", "k_proj", "v_proj", "o_proj"]
-    mismatch_logit_value: float = 50.0  # 用于 Match 位置的强制 logit 值 (不用 inf 避免数值问题)
+    sep_token_id: int = 128009  # Llama-3 的 <|eot_id|> token
+    mismatch_logit_value: float = 50.0  # 用于 Match 位置的强制 logit 值
+    
+    # 兼容旧代码的字段 (虽然可能不再直接使用)
+    lora_rank: int = 8
+    lora_alpha: int = 16
+    lora_dropout: float = 0
+    target_modules: str = "all"
+    score_head_hidden_size: Optional[int] = None
     
     def __post_init__(self):
+        # 允许从环境变量覆盖配置
         if self.score_head_hidden_size is None:
             self.score_head_hidden_size = self.hidden_size // 4
-        if self.target_modules is None:
-            self.target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 
 @dataclass
 class SPDInputData:
     """
     SPD 模型的输入数据结构
-    
-    Attributes:
-        input_ids: [Batch, Seq_Len] - 完整输入序列
-        attention_mask: 注意力掩码，支持两种格式:
-            - [Batch, Seq_Len]: 简单 Padding Mask (模型内部会自动生成 Causal Mask)
-            - [Batch, 1, Seq_Len, Seq_Len]: 完整 4D Mask (用于自定义 Attention 模式)
-              使用 create_spd_attention_mask() 生成混合 Mask (Context Causal + Draft/Target Bidirectional)
-        position_ids: [Batch, Seq_Len] - 位置编码
-        draft_start_idx: 每个样本中 Draft Tokens 的起始索引
-        draft_end_idx: 每个样本中 Draft Tokens 的结束索引
-        target_start_idx: 每个样本中 Target Tokens 的起始索引
-        target_end_idx: 每个样本中 Target Tokens 的结束索引
-        draft_tokens: [Batch, Draft_Len] - Draft Tokens (用于构建 Mismatch Mask)
-        target_tokens: [Batch, Draft_Len] - Target Tokens (与 Draft 对齐)
     """
     input_ids: torch.Tensor
     attention_mask: torch.Tensor
@@ -92,65 +75,43 @@ class SPDInputData:
 
 
 # ==============================================================================
-# 2. Score Head 定义
+# 2. Score Head 定义 (与 AcceptHead 结构一致)
 # ==============================================================================
 
 class ScoreHead(nn.Module):
     """
-    评分头模块
-    
-    结构: Linear(hidden_size -> hidden_size/4) -> ReLU -> Linear(hidden_size/4 -> 1)
-    
-    输出: 每个 Token 位置的评分 logit (用于 Accept/Reject 二分类)
+    轻量级回归头，将隐藏状态映射为接受概率的 logits
+    结构：LayerNorm → Linear(H→H/4) → GELU → Linear(H/4→1)
     """
-    
-    def __init__(self, hidden_size: int, intermediate_size: Optional[int] = None):
-        """
-        初始化 Score Head
-        
-        Args:
-            hidden_size: 输入隐藏层维度
-            intermediate_size: 中间层维度，默认 hidden_size // 4
-        """
+    def __init__(self, hidden_size: int):
         super().__init__()
+        self.layer_norm = nn.LayerNorm(hidden_size)
+        self.fc1 = nn.Linear(hidden_size, hidden_size // 4)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden_size // 4, 1)
         
-        if intermediate_size is None:
-            intermediate_size = hidden_size // 4
-        
-        self.intermediate_size = intermediate_size
-        
-        # 两层 MLP: hidden_size -> intermediate_size -> 1
-        self.fc1 = nn.Linear(hidden_size, intermediate_size, bias=True)
-        self.activation = nn.ReLU()
-        self.fc2 = nn.Linear(intermediate_size, 1, bias=True)
-        
-        # 初始化权重
         self._init_weights()
-    
+
     def _init_weights(self):
-        """权重初始化 (Xavier 初始化)"""
-        nn.init.xavier_uniform_(self.fc1.weight)
-        nn.init.zeros_(self.fc1.bias)
-        nn.init.xavier_uniform_(self.fc2.weight)
-        nn.init.zeros_(self.fc2.bias)
-    
+        nn.init.kaiming_uniform_(self.fc1.weight, a=0, mode='fan_in', nonlinearity='relu')
+        if self.fc1.bias is not None:
+            nn.init.zeros_(self.fc1.bias)
+        nn.init.xavier_uniform_(self.fc2.weight, gain=0.1)
+        if self.fc2.bias is not None:
+            nn.init.zeros_(self.fc2.bias)
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
-        前向传播
-        
         Args:
-            hidden_states: [Batch, Seq_Len, Hidden_Size] - Transformer 输出的隐藏状态
-        
+            hidden_states: [Batch, Seq_Len, Hidden_Size]
         Returns:
-            logits: [Batch, Seq_Len, 1] - 每个位置的评分 logit
+            logits: [Batch, Seq_Len, 1]
         """
-        # [Batch, Seq_Len, Hidden_Size] -> [Batch, Seq_Len, Intermediate_Size]
-        x = self.fc1(hidden_states)
-        x = self.activation(x)
-        # [Batch, Seq_Len, Intermediate_Size] -> [Batch, Seq_Len, 1]
-        logits = self.fc2(x)
-        
-        return logits
+        x = self.layer_norm(hidden_states)
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.fc2(x)
+        return x # 保持 [Batch, Seq_Len, 1] 形状，ScoringActor 会处理 squeeze
 
 
 # ==============================================================================
@@ -161,155 +122,121 @@ class ScoringActor(nn.Module):
     """
     Speculative Decoding 评分模型 (ScoringActor)
     
-    基于 Llama-3-8B + LoRA + Score Head 的自定义模型
-    
-    输入格式: [Context Tokens] + [SEP] + [Draft Tokens] + [SEP] + [Target Tokens] + [SEP]
-    
     核心功能:
-        1. 使用 LoRA 微调 Backbone
-        2. 替换 lm_head 为 score_head (二分类输出)
-        3. Mismatch 聚焦策略: Draft == Target 时强制接受
-    
-    Forward 输出:
-        - logits: [Batch, Draft_Seq_Len, 1] - 每个 Draft Token 位置的 Accept/Reject logit
-        - probs: [Batch, Draft_Seq_Len] - 经过 sigmoid 和 mismatch mask 修正后的接受概率
-        - match_mask: [Batch, Draft_Seq_Len] - Draft == Target 的掩码
+        1. 加载 Backbone (Llama-3)
+        2. 替换 lm_head 为 ScoreHead
+        3. 加载 Peft Adapter (包含 LoRA 和 ScoreHead 权重)
     """
     
     def __init__(self, config: ScoringModelConfig, backbone: nn.Module = None):
-        """
-        初始化 ScoringActor
-        
-        Args:
-            config: 模型配置
-            backbone: 可选的预加载 backbone 模型
-        """
         super().__init__()
-        
         self.config = config
         
-        # ----------------------------------------------------------------------
-        # 步骤 1: 加载 Backbone 模型
-        # ----------------------------------------------------------------------
+        # 1. 加载 Backbone 并应用 Adapter
         if backbone is not None:
             self.backbone = backbone
-            logging.info("使用传入的 backbone 模型")
+            logger.info("使用传入的 backbone 模型")
         else:
-            self.backbone = self._load_backbone()
+            self._init_model()
+            
+        # 设置 transformer 引用 (用于获取 hidden states)
+        # self.backbone 是 PeftModel
+        # self.backbone.base_model 是 LlamaForCausalLM (或 wrapped)
+        # 我们需要访问底层的 model (LlamaModel)
+        if hasattr(self.backbone, "get_base_model"):
+             base_model = self.backbone.get_base_model()
+        else:
+             base_model = self.backbone
+             
+        if hasattr(base_model, "model"):
+            self.transformer = base_model.model
+        else:
+            self.transformer = base_model
+            
+        # 设置 score_head 引用 (指向替换后的 lm_head)
+        # 注意: PeftModel 可能会包装 modules_to_save
+        # 我们尝试获取有效的 head
+        self.score_head = self._get_active_head()
         
-        # ----------------------------------------------------------------------
-        # 步骤 2: 创建 Score Head (可训练)
-        # ----------------------------------------------------------------------
-        self.score_head = ScoreHead(
-            hidden_size=config.hidden_size,
-            intermediate_size=config.score_head_hidden_size
-        )
+        # 冻结参数 (PeftModel 默认已经冻结了非 LoRA/ModulesToSave 参数，这里再次确认)
+        self.score_head.requires_grad_(True) 
         
-        # ----------------------------------------------------------------------
-        # 步骤 3: 应用 LoRA 适配器 (仅微调部分参数) 并设置 self.transformer
-        # ----------------------------------------------------------------------
-        self._apply_lora()
+        logger.info(f"ScoringActor 初始化完成:")
+        logger.info(f"  - Backbone: {config.model_name_or_path}")
+        logger.info(f"  - Adapter: {config.adapter_path}")
+
+    def _init_model(self):
+        """加载模型、替换 Head、加载 Adapter"""
+        logger.info(f"正在加载 Backbone: {self.config.model_name_or_path}")
         
-        # ----------------------------------------------------------------------
-        # 步骤 5: 冻结非训练参数
-        # ----------------------------------------------------------------------
-        self._freeze_parameters()
-        
-        logging.info(f"ScoringActor 初始化完成:")
-        logging.info(f"  - Backbone: {config.model_name_or_path}")
-        logging.info(f"  - LoRA Rank: {config.lora_rank}")
-        logging.info(f"  - Score Head: {config.hidden_size} -> {config.score_head_hidden_size} -> 1")
-    
-    def _load_backbone(self) -> nn.Module:
-        """
-        加载预训练的 Backbone 模型
-        
-        Returns:
-            backbone: 预训练的 Transformer 模型
-        """
-        from transformers import AutoModelForCausalLM, AutoConfig
-        
-        logging.info(f"正在加载 Backbone: {self.config.model_name_or_path}")
-        
-        # 加载模型配置
-        model_config = AutoConfig.from_pretrained(
+        # 1. 加载 Base Model
+        model = AutoModelForCausalLM.from_pretrained(
             self.config.model_name_or_path,
+            torch_dtype=torch.bfloat16,
             trust_remote_code=True
         )
         
-        # 更新 hidden_size 配置
-        if hasattr(model_config, 'hidden_size'):
-            self.config.hidden_size = model_config.hidden_size
-            self.config.score_head_hidden_size = model_config.hidden_size // 4
+        # 更新 hidden_size
+        if hasattr(model.config, 'hidden_size'):
+            self.config.hidden_size = model.config.hidden_size
+            
+        # 2. 替换 lm_head 为 ScoreHead
+        self._replace_lm_head(model)
         
-        # 加载预训练模型
-        backbone = AutoModelForCausalLM.from_pretrained(
-            self.config.model_name_or_path,
-            config=model_config,
-            torch_dtype=torch.bfloat16,  # 使用 bf16 节省显存
-            trust_remote_code=True,
-        )
-        
-        logging.info(f"Backbone 加载完成, hidden_size={self.config.hidden_size}")
-        return backbone
-    
-    def _apply_lora(self):
-        """
-        应用 LoRA 适配器到 Backbone
-        
-        LoRA 只在指定的 target_modules 上添加低秩分解的适配器
-        """
-        from peft import LoraConfig, TaskType, get_peft_model
-        
-        # 配置 LoRA
-        lora_config = LoraConfig(
-            task_type=TaskType.FEATURE_EXTRACTION,  # 我们做特征提取而非语言建模
-            r=self.config.lora_rank,
-            lora_alpha=self.config.lora_alpha,
-            lora_dropout=self.config.lora_dropout,
-            target_modules=self.config.target_modules,
-            bias="none",  # 不训练 bias
-        )
-        
-        # 应用 LoRA 到 backbone
-        # 注意: 我们在 transformer (内部 model) 上应用 LoRA
-        if hasattr(self.backbone, 'model'):
-            self.backbone.model = get_peft_model(self.backbone.model, lora_config)
-            self.transformer = self.backbone.model
+        # 3. 加载 Peft Adapter
+        if self.config.adapter_path:
+            logger.info(f"Loading adapter from {self.config.adapter_path}...")
+            # is_trainable=True 确保 modules_to_save (ScoreHead) 被正确加载为可训练状态
+            model = PeftModel.from_pretrained(
+                model,
+                self.config.adapter_path,
+                is_trainable=True
+            )
         else:
-            self.backbone = get_peft_model(self.backbone, lora_config)
-            self.transformer = self.backbone
+            logger.warning("未提供 adapter_path，使用未初始化的 ScoreHead (仅供测试)")
+            
+        self.backbone = model
+
+    def _replace_lm_head(self, model):
+        """将模型的 lm_head 替换为 ScoreHead"""
+        hidden_size = self.config.hidden_size
+        score_head = ScoreHead(hidden_size=hidden_size)
         
-        logging.info(f"LoRA 适配器已应用: rank={self.config.lora_rank}, alpha={self.config.lora_alpha}")
-        logging.info(f"目标模块: {self.config.target_modules}")
-    
-    def _freeze_parameters(self):
-        """
-        冻结参数
-        
-        策略:
-            - 冻结: Backbone 的所有原始参数 (peft 库会自动处理)
-            - 可训练: Score Head 参数 (需要手动设置)
-        """
-        # Score Head 的参数始终可训练
-        for param in self.score_head.parameters():
-            param.requires_grad = True
-        
-        # 打印所有可训练参数名称，以供检查
-        trainable_param_names = [n for n, p in self.named_parameters() if p.requires_grad]
-        
-        logging.info("可训练参数列表:")
-        for name in trainable_param_names:
-            logging.info(f"  - {name}")
-        
-        # 统计可训练参数数量
-        total_params = sum(p.numel() for p in self.parameters())
-        trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        
-        logging.info(f"参数冻结完成:")
-        logging.info(f"  - 总参数量: {total_params:,}")
-        logging.info(f"  - 可训练参数: {trainable_params:,} ({100 * trainable_params / total_params:.2f}%)")
-    
+        replaced = False
+        if hasattr(model, "lm_head"):
+            device = next(model.lm_head.parameters()).device
+            dtype = next(model.lm_head.parameters()).dtype
+            model.lm_head = score_head.to(device=device, dtype=dtype)
+            replaced = True
+        elif hasattr(model, "model") and hasattr(model.model, "lm_head"):
+            # 有些模型封装在 .model 下
+            device = next(model.model.lm_head.parameters()).device
+            dtype = next(model.model.lm_head.parameters()).dtype
+            model.model.lm_head = score_head.to(device=device, dtype=dtype)
+            replaced = True
+            
+        if not replaced:
+            logger.warning("Could not find 'lm_head' to replace automatically.")
+        else:
+            logger.info(f"Successfully replaced lm_head with ScoreHead (hidden_size={hidden_size})")
+
+    def _get_active_head(self):
+        """获取当前的 ScoreHead 引用"""
+        # 尝试从 PeftModel 中找到 lm_head
+        # PeftModel -> Base Model -> lm_head
+        if hasattr(self.backbone, "lm_head"):
+            return self.backbone.lm_head
+            
+        # 如果 Peft 包装了
+        base = self.backbone.get_base_model() if hasattr(self.backbone, "get_base_model") else self.backbone
+        if hasattr(base, "lm_head"):
+            return base.lm_head
+            
+        if hasattr(base, "model") and hasattr(base.model, "lm_head"):
+            return base.model.lm_head
+            
+        raise ValueError("Cannot locate lm_head (ScoreHead) in the model structure")
+
     def _create_match_mask(
         self,
         draft_tokens: torch.Tensor,
@@ -317,19 +244,8 @@ class ScoringActor(nn.Module):
     ) -> torch.Tensor:
         """
         创建 Mismatch Mask
-        
-        逻辑:
-            - match_mask[i] = True: 表示 draft_tokens[i] == target_tokens[i] (Match)
-            - match_mask[i] = False: 表示 draft_tokens[i] != target_tokens[i] (Mismatch)
-        
-        Args:
-            draft_tokens: [Batch, Draft_Len] - Draft 模型生成的 Token IDs
-            target_tokens: [Batch, Draft_Len] - Target 模型生成的 Token IDs
-        
-        Returns:
-            match_mask: [Batch, Draft_Len] - 布尔掩码
+        match_mask[i] = True 表示 draft == target (Match)
         """
-        # 逐位置比较 Draft 和 Target Token IDs
         match_mask = (draft_tokens == target_tokens)
         return match_mask
     
@@ -340,33 +256,10 @@ class ScoringActor(nn.Module):
     ) -> torch.Tensor:
         """
         应用 Mismatch 聚焦策略
-        
-        核心逻辑:
-            - 对于 Match 位置 (draft == target): 强制 logit = +large_value (确保 100% 接受)
-            - 对于 Mismatch 位置: 保持原始 logit (让模型学习判断)
-        
-        目的:
-            - 在推测解码中，相同的 Token 必须被接受
-            - 模型应聚焦于学习 "Mismatch 情况下是否应该接受 Draft Token"
-        
-        Args:
-            logits: [Batch, Draft_Len, 1] - 原始评分 logits
-            match_mask: [Batch, Draft_Len] - Match 位置为 True
-        
-        Returns:
-            masked_logits: [Batch, Draft_Len, 1] - 修正后的 logits
         """
-        # 扩展 match_mask 维度以匹配 logits: [Batch, Draft_Len] -> [Batch, Draft_Len, 1]
         match_mask_expanded = match_mask.unsqueeze(-1)
-        
-        # 创建强制接受的 logit 值
         force_accept_logit = torch.full_like(logits, self.config.mismatch_logit_value)
-        
-        # 使用 where 进行条件替换:
-        # - match_mask=True (Match): 使用 force_accept_logit
-        # - match_mask=False (Mismatch): 保持原始 logit
         masked_logits = torch.where(match_mask_expanded, force_accept_logit, logits)
-        
         return masked_logits
     
     def _extract_draft_hidden_states(
@@ -376,56 +269,24 @@ class ScoringActor(nn.Module):
         draft_end_idx: torch.Tensor
     ) -> torch.Tensor:
         """
-        从完整的 hidden states 中提取 Draft Token 位置的隐藏状态 (Fixed Length Optimization)
-        
-        假设: 所有样本的 Draft Length 相同
-        
-        Args:
-            hidden_states: [Batch, Seq_Len, Hidden_Size]
-            draft_start_idx: [Batch]
-            draft_end_idx: [Batch] - 在此假设下，end - start 是常数
-        
-        Returns:
-            draft_hidden: [Batch, Draft_Len, Hidden_Size]
+        从完整的 hidden states 中提取 Draft Token 位置的隐藏状态
         """
         batch_size, seq_len, hidden_size = hidden_states.shape
         device = hidden_states.device
         
-        # 验证假设 (仅调试用，可移除)
-        # draft_len = (draft_end_idx - draft_start_idx)[0].item()
-        
-        # 只需要计算第一个样本的 draft_len
         draft_len = (draft_end_idx[0] - draft_start_idx[0]).item()
-        
         if draft_len <= 0:
-             raise ValueError(f"draft_len <= 0: {draft_len}")
-
-        # 1. 构建 gather 索引 [Batch, Draft_Len]
-        # 因为长度固定，不需要 Mask 处理 Padding
-        # grid: [0, 1, ..., draft_len-1]
+             # Fallback just in case
+             return hidden_states
+             
         grid = torch.arange(draft_len, device=device).unsqueeze(0) # [1, L]
-        
-        # indices[b, i] = draft_start_idx[b] + i
-        # draft_start_idx: [B] -> [B, 1]
-        # gather_indices: [B, 1] + [1, L] -> [B, L]
         gather_indices = draft_start_idx.unsqueeze(1) + grid # [B, L]
         
-        # 2. 提取 (Flat Indexing)
-        # hidden_states: [B, S, H] -> [B*S, H]
         flat_hidden = hidden_states.view(-1, hidden_size)
-        
-        # batch_offsets: [0, S, 2S, ...]
-        # [B] -> [B, 1]
         batch_offsets = (torch.arange(batch_size, device=device) * seq_len).unsqueeze(1)
-        
-        # flat_indices: [B, L] + [B, 1] -> [B, L] -> view(-1) -> [B*L]
-        # 利用广播机制相加
         flat_indices = (gather_indices + batch_offsets).view(-1)
         
-        # Gather & Reshape
-        # flat_hidden[flat_indices]: [B*L, H]
         draft_hidden = flat_hidden[flat_indices].view(batch_size, draft_len, hidden_size)
-        
         return draft_hidden
 
     def forward(
@@ -442,141 +303,101 @@ class ScoringActor(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """
         前向传播
-        
-        完整流程:
-            1. 通过 Transformer Backbone 获取 hidden states
-            2. 提取 Draft Token 位置的 hidden states
-            3. 通过 Score Head 计算 logits
-            4. 应用 Mismatch Mask (Match 位置强制接受)
-            5. 计算接受概率
-        
-        Args:
-            input_ids: [Batch, Seq_Len] - 完整输入 [Context + SEP + Draft + SEP + Target + SEP]
-            attention_mask: [Batch, Seq_Len] - 注意力掩码
-            position_ids: [Batch, Seq_Len] - 位置编码 (可选)
-            draft_start_idx: [Batch] - Draft Tokens 起始位置
-            draft_end_idx: [Batch] - Draft Tokens 结束位置
-            draft_tokens: [Batch, Draft_Len] - Draft Token IDs
-            target_tokens: [Batch, Draft_Len] - Target Token IDs
-            return_dict: 是否返回字典格式
-        
-        Returns:
-            Dict containing:
-                - raw_logits: [Batch, Draft_Len, 1] - 原始评分 logits (未 mask)
-                - masked_logits: [Batch, Draft_Len, 1] - 经 Mismatch Mask 修正后的 logits
-                - probs: [Batch, Draft_Len] - 接受概率 (sigmoid(masked_logits))
-                - match_mask: [Batch, Draft_Len] - Match 位置掩码
-                - hidden_states: [Batch, Draft_Len, Hidden_Size] - Draft 位置的隐藏状态
         """
         batch_size = input_ids.size(0)
-        device = input_ids.device
         
-        # ----------------------------------------------------------------------
-        # Step 1: Transformer Forward
-        # 通过冻结的 Backbone + LoRA 获取 hidden states
-        # ----------------------------------------------------------------------
-        # 处理 Attention Mask (如果是 2D Padding Mask，则升级为 4D SPD Mask)
+        # ==================== DEBUG: ScoringActor Forward 开始 ====================
+        logger.debug("=" * 50)
+        logger.debug("[ScoringActor Forward] 开始前向传播")
+        logger.debug(f"[ScoringActor Forward] batch_size: {batch_size}")
+        logger.debug(f"[ScoringActor Forward] input_ids shape: {input_ids.shape}")
+        logger.debug(f"[ScoringActor Forward] attention_mask shape: {attention_mask.shape}")
+        
+        # 1. Transformer Forward (Backbone Only)
+        # 处理 Attention Mask
         if attention_mask is not None and attention_mask.dim() == 2:
             if draft_start_idx is not None:
-                # 使用 draft_start_idx 作为分界点 (context_len)
-                # 这意味着 [0, draft_start_idx) 是 Causal 的
-                # [draft_start_idx, end) 是 Bidirectional 的
-                context_lens = draft_start_idx
-                
-                # 计算 seq_lens (Batch 中每个样本的真实长度)
                 seq_lens = attention_mask.sum(dim=-1)
-                
-                # 获取 max_seq_len (用于 4D mask 尺寸)
                 max_seq_len = input_ids.size(1)
+                pad_lens = max_seq_len - seq_lens
+                context_lens = draft_start_idx - pad_lens
+                context_lens = torch.clamp(context_lens, min=0)
                 
-                # 创建 4D Mask
-                # 注意: 需要确保 draft_len/target_len 逻辑与 mask 创建一致
-                # 这里主要依赖 context_lens 和 seq_lens
                 attention_mask = create_spd_attention_mask(
                     context_lens=context_lens,
                     seq_lens=seq_lens,
                     padding_mask=attention_mask,
-                    dtype=self.backbone.dtype if hasattr(self.backbone, "dtype") else torch.bfloat16
+                    dtype=self.score_head.fc1.weight.dtype # Use head dtype
                 )
-                logging.debug("已自动将 2D attention_mask 升级为 4D SPD Mask")
 
-        # 既然强制使用了 LoRA，self.transformer 就是 PeftModel
-        # 我们直接调用 base_model 以获取原始 Transformer 的输出
-        transformer_outputs = self.transformer.base_model(
+        # 获取 hidden states (不经过 Head)
+        transformer_outputs = self.transformer(
             input_ids=input_ids,
             attention_mask=attention_mask,
             position_ids=position_ids,
             output_hidden_states=True,
             return_dict=True,
-            use_cache=False,  # 训练时不使用 cache
+            use_cache=False,
         )
         
-        # 获取最后一层的 hidden states: [Batch, Seq_Len, Hidden_Size]
-        # LlamaModel 的输出一定包含 last_hidden_state
         full_hidden_states = transformer_outputs.last_hidden_state
         
-        # ----------------------------------------------------------------------
-        # Step 2: 提取 Draft Token 位置的 Hidden States
-        # ----------------------------------------------------------------------
+        # 2. 提取 Draft Hidden States
         if draft_start_idx is not None and draft_end_idx is not None:
-            # 使用提供的位置信息提取
             draft_hidden_states = self._extract_draft_hidden_states(
                 full_hidden_states, draft_start_idx, draft_end_idx
             )
+            # ==================== DEBUG: Draft Hidden States ====================
+            logger.debug(f"[ScoringActor Forward] draft_start_idx: {draft_start_idx.tolist()[:3]}... (first 3)")
+            logger.debug(f"[ScoringActor Forward] draft_end_idx: {draft_end_idx.tolist()[:3]}... (first 3)")
+            logger.debug(f"[ScoringActor Forward] draft_hidden_states shape: {draft_hidden_states.shape}")
         else:
-            # 如果未提供位置信息，假设整个序列都是 Draft (用于测试)
             draft_hidden_states = full_hidden_states
-            logging.warning("未提供 draft_start_idx/draft_end_idx，使用完整序列")
+            logger.debug(f"[ScoringActor Forward] 使用完整 hidden states, shape: {draft_hidden_states.shape}")
         
-        # ----------------------------------------------------------------------
-        # Step 3: Score Head Forward
-        # 计算每个 Draft Token 的评分 logit
-        # ----------------------------------------------------------------------
+        # 3. Score Head Forward
         # [Batch, Draft_Len, Hidden_Size] -> [Batch, Draft_Len, 1]
         raw_logits = self.score_head(draft_hidden_states)
         
-        # ----------------------------------------------------------------------
-        # Step 4: 创建并应用 Mismatch Mask
-        # ----------------------------------------------------------------------
+        # ==================== DEBUG: Raw Logits ====================
+        logger.debug(f"[ScoringActor Forward] raw_logits shape: {raw_logits.shape}")
+        logger.debug(f"[ScoringActor Forward] raw_logits 统计: min={raw_logits.min().item():.4f}, max={raw_logits.max().item():.4f}, mean={raw_logits.mean().item():.4f}")
         
-        # 创建 Match Mask: draft == target 为 True
+        # 4. Mismatch Mask
         match_mask = self._create_match_mask(draft_tokens, target_tokens)
-        
-        # 应用 Mask: Match 位置强制 logit = +large_value
         masked_logits = self._apply_match_mask(raw_logits, match_mask)
         
-        # ----------------------------------------------------------------------
-        # Step 5: 计算接受概率
-        # ----------------------------------------------------------------------
-        # Sigmoid: logit -> [0, 1] 概率
-        # [Batch, Draft_Len, 1] -> [Batch, Draft_Len]
+        # ==================== DEBUG: Match Mask ====================
+        match_count = match_mask.sum().item()
+        total_count = match_mask.numel()
+        logger.debug(f"[ScoringActor Forward] match_mask 统计: match={int(match_count)}/{total_count} ({match_count/total_count*100:.1f}%)")
+        logger.debug(f"[ScoringActor Forward] masked_logits 统计: min={masked_logits.min().item():.4f}, max={masked_logits.max().item():.4f}")
+        
+        # 5. Probabilities
         probs = torch.sigmoid(masked_logits).squeeze(-1)
         
-        # ----------------------------------------------------------------------
-        # 返回结果
-        # ----------------------------------------------------------------------
+        # ==================== DEBUG: Probabilities ====================
+        logger.debug(f"[ScoringActor Forward] probs shape: {probs.shape}")
+        logger.debug(f"[ScoringActor Forward] probs 统计: min={probs.min().item():.4f}, max={probs.max().item():.4f}, mean={probs.mean().item():.4f}")
+        # 打印第一个样本的详细信息
+        if batch_size > 0 and probs.dim() > 1 and probs.shape[1] > 0:
+            logger.debug(f"[ScoringActor Forward Sample 0] probs: {[f'{p:.3f}' for p in probs[0].tolist()[:10]]}... (first 10)")
+            logger.debug(f"[ScoringActor Forward Sample 0] match_mask: {match_mask[0].tolist()[:10]}... (first 10)")
+        logger.debug("=" * 50)
+        
         if return_dict:
             return {
-                "raw_logits": raw_logits,           # 原始 logits (用于监督学习 loss)
-                "masked_logits": masked_logits,     # 修正后的 logits (用于采样)
-                "probs": probs,                      # 接受概率
-                "match_mask": match_mask,            # Match 掩码 (用于 reward 计算)
-                "hidden_states": draft_hidden_states # 隐藏状态 (用于调试)
+                "raw_logits": raw_logits,
+                "masked_logits": masked_logits,
+                "probs": probs,
+                "match_mask": match_mask,
+                "hidden_states": draft_hidden_states
             }
         else:
             return masked_logits
     
-    
     def get_trainable_parameters(self) -> List[nn.Parameter]:
-        """
-        获取所有可训练参数
-        
-        Returns:
-            trainable_params: 可训练参数列表
-        """
         return [p for p in self.parameters() if p.requires_grad]
-
-
 
 
 class AutoModelForSPDScoring:
@@ -590,34 +411,40 @@ class AutoModelForSPDScoring:
     @classmethod
     def from_config(cls, config, **kwargs):
         """
-        Args:
-            config: HuggingFace PretrainedConfig
-            kwargs: 其他参数
+        config: 在这里通常是传入的 pretrained_model_name_or_path 字符串，或者是 HuggingFace Config
         """
-        # 优先从环境变量读取配置 (由 train_spd_scorer.py 注入)
-        # 这避免了在 verl 复杂的调用栈中透传参数的困难
-        model_path = os.getenv("SPD_MODEL_PATH", getattr(config, "_name_or_path", "meta-llama/Llama-3-8B"))
+        # 1. 确定 Base Model Path
+        # 优先使用环境变量，否则使用参数
+        env_model_path = os.getenv("SPD_MODEL_PATH")
+        if env_model_path:
+            model_path = env_model_path
+        elif isinstance(config, str):
+            model_path = config
+        elif hasattr(config, "_name_or_path"):
+            model_path = config._name_or_path
+        else:
+            model_path = "meta-llama/Llama-3-8B"
+            
+        # 2. 确定 Adapter Path
+        adapter_path = os.getenv("SPD_ADAPTER_PATH")
         
-        # LoRA 配置
-        lora_rank = int(os.getenv("SPD_LORA_RANK", "16"))
-        lora_alpha = int(os.getenv("SPD_LORA_ALPHA", "32"))
+        # 3. 其他配置
+        hidden_size = 4096
+        if hasattr(config, "hidden_size"):
+             hidden_size = config.hidden_size
         
-        # 记录一下实际使用的配置，方便调试
-        logging.info(f"[AutoModelForSPDScoring] Initializing with env vars:")
-        logging.info(f"  - Model Path: {model_path}")
-        logging.info(f"  - LoRA Rank: {lora_rank}")
-        logging.info(f"  - LoRA Alpha: {lora_alpha}")
+        logger.info(f"[AutoModelForSPDScoring] Initializing:")
+        logger.info(f"  - Model Path: {model_path}")
+        logger.info(f"  - Adapter Path: {adapter_path}")
         
-        # 创建 SPD Config
+        # 创建 Config
         spd_config = ScoringModelConfig(
             model_name_or_path=model_path,
-            hidden_size=getattr(config, 'hidden_size', 4096),
-            lora_rank=lora_rank,
-            lora_alpha=lora_alpha,
-            # 其他参数...
+            adapter_path=adapter_path,
+            hidden_size=hidden_size
         )
         
-        # 2. 实例化 Actor
+        # 实例化 Actor
         model = ScoringActor(spd_config)
         return model
 
@@ -633,28 +460,12 @@ def create_hybrid_attention_mask(
 ) -> torch.Tensor:
     """
     创建单样本的混合 Attention Mask
-    
-    Attention 策略:
-        - [0, context_len): Causal Mask
-        - [context_len, seq_len): Full Bidirectional Mask
-    
-    Args:
-        seq_len: 当前样本的总长度
-        context_len: 上下文分界点
-    
-    Returns:
-        mask: [Seq_Len, Seq_Len] (2D)
     """
     mask = torch.zeros(seq_len, seq_len, device=device, dtype=dtype)
-    
-    # 1. Context 部分: Causal
     mask[:context_len, :context_len] = torch.tril(
         torch.ones(context_len, context_len, device=device, dtype=dtype)
     )
-    
-    # 2. 后半部分: Full Bidirectional
     mask[context_len:, :] = 1.0
-        
     return mask
 
 
@@ -664,19 +475,10 @@ def create_hybrid_attention_mask_batch(
     max_seq_len: int,
     device: torch.device,
     dtype: torch.dtype = torch.float32,
-    is_left_padding: bool = True, # 默认为 Left Padding
+    is_left_padding: bool = True,
 ) -> torch.Tensor:
     """
-    批量创建混合 Attention Mask (处理变长序列)
-    
-    Args:
-        context_lens: 每个样本的 Context 长度列表
-        seq_lens: 每个样本的总长度列表
-        max_seq_len: Batch 内的最大长度
-        is_left_padding: 是否为 Left Padding (verl 默认 True)
-    
-    Returns:
-        batch_mask: [Batch, 1, Max_Seq_Len, Max_Seq_Len]
+    批量创建混合 Attention Mask
     """
     batch_size = len(context_lens)
     batch_mask = torch.zeros(batch_size, 1, max_seq_len, max_seq_len, device=device, dtype=dtype)
@@ -684,18 +486,12 @@ def create_hybrid_attention_mask_batch(
     for i in range(batch_size):
         c_len = context_lens[i]
         s_len = seq_lens[i]
-        
-        # 生成单样本 Mask [s_len, s_len]
         single_mask = create_hybrid_attention_mask(s_len, c_len, device, dtype)
         
         if is_left_padding:
-            # Left Padding: 数据靠右对齐
-            # 有效数据区域: [max_seq_len - s_len : max_seq_len]
             offset = max_seq_len - s_len
             batch_mask[i, 0, offset:, offset:] = single_mask
         else:
-            # Right Padding: 数据靠左对齐 (默认)
-            # 有效数据区域: [0 : s_len]
             batch_mask[i, 0, :s_len, :s_len] = single_mask
         
     return batch_mask
@@ -707,29 +503,15 @@ def combine_hybrid_and_padding_mask(
 ) -> torch.Tensor:
     """
     将 Hybrid Mask 与 Padding Mask 结合
-    
-    Args:
-        hybrid_mask: [Batch, 1, Seq_Len, Seq_Len] - 混合注意力 Mask (1=可见, 0=不可见)
-        padding_mask: [Batch, Seq_Len] - Padding Mask (1=真实Token, 0=Padding)
-    
-    Returns:
-        combined_mask: [Batch, 1, Seq_Len, Seq_Len] - 结合后的 Mask (1=可见, 0=不可见)
     """
     batch_size, _, seq_len, _ = hybrid_mask.shape
     device = hybrid_mask.device
     dtype = hybrid_mask.dtype
     
-    # 扩展 padding_mask 为 4D
-    # [Batch, Seq_Len] -> [Batch, 1, 1, Seq_Len] (Key 维度的 Mask)
-    # 表示: 哪些 Key 位置是有效的 (可以被 attend 到)
     padding_mask_4d = padding_mask.unsqueeze(1).unsqueeze(2)  # [B, 1, 1, S]
     padding_mask_4d = padding_mask_4d.to(dtype)
     
-    # 结合: 两者都为 1 时才能 attend
-    # hybrid_mask: [B, 1, S, S] - 结构性 Mask (Causal/Bidirectional)
-    # padding_mask_4d: [B, 1, 1, S] - 广播到 [B, 1, S, S]
     combined_mask = hybrid_mask * padding_mask_4d
-    
     return combined_mask
 
 
@@ -739,23 +521,9 @@ def convert_mask_to_4d_attention_mask(
 ) -> torch.Tensor:
     """
     将 0/1 Mask 转换为 Hugging Face 模型可用的 4D Attention Mask
-    
-    Hugging Face 的 Attention 实现期望:
-        - 可以 attend 的位置: 0
-        - 不能 attend 的位置: 一个很大的负数 (如 -10000 或 -inf)
-    
-    Args:
-        combined_mask: [Batch, 1, Seq_Len, Seq_Len], 1 = 可以看到, 0 = 不能看到
-        dtype: 输出数据类型
-    
-    Returns:
-        attention_mask: [Batch, 1, Seq_Len, Seq_Len], 0 = 可以看到, -large = 不能看到
     """
-    # 将 1 变成 0, 0 变成 -inf (或一个很大的负数)
-    # 使用 torch.finfo(dtype).min 可能导致数值问题，使用 -10000 更安全
     inverted_mask = 1.0 - combined_mask.to(dtype)
     attention_mask = inverted_mask * torch.finfo(dtype).min
-    
     return attention_mask
 
 
@@ -766,42 +534,29 @@ def create_spd_attention_mask(
     dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
     """
-    一站式创建 SPD 场景的完整 4D Attention Mask (支持 Batch 变长 Context)
-    
-    Args:
-        context_lens: [Batch] 每个样本的 Context 长度 (分界点)
-        seq_lens: [Batch] 每个样本的总长度
-        padding_mask: [Batch, Max_Seq_Len] - Padding Mask
-        dtype: 数据类型
-    
-    Returns:
-        attention_mask: [Batch, 1, Max_Seq_Len, Max_Seq_Len]
+    一站式创建 SPD 场景的完整 4D Attention Mask
     """
     batch_size = padding_mask.shape[0]
     max_seq_len = padding_mask.shape[1]
     device = padding_mask.device
     
-    # 转换为 List 以便循环
     c_lens = context_lens.tolist()
     s_lens = seq_lens.tolist()
     
-    # Step 1: 创建 Batch Hybrid Mask
     hybrid_mask = create_hybrid_attention_mask_batch(
         context_lens=c_lens,
         seq_lens=s_lens,
-        max_seq_len=max_seq_len, # 显式传入画布大小
+        max_seq_len=max_seq_len, 
         device=device,
-        dtype=torch.float32,
-        is_left_padding=True # 显式指定 Left Padding
+        dtype=dtype,
+        is_left_padding=True 
     )
     
-    # Step 2: 与 Padding Mask 结合
     combined_mask = combine_hybrid_and_padding_mask(
         hybrid_mask=hybrid_mask,
         padding_mask=padding_mask,
     )
     
-    # Step 3: 转换为 Attention Mask 格式
     attention_mask = convert_mask_to_4d_attention_mask(
         combined_mask=combined_mask,
         dtype=dtype,
@@ -813,16 +568,7 @@ def create_spd_attention_mask(
 def create_position_ids(attention_mask: torch.Tensor) -> torch.Tensor:
     """
     根据 attention_mask 创建 position_ids
-    
-    Args:
-        attention_mask: [Batch, Seq_Len]
-    
-    Returns:
-        position_ids: [Batch, Seq_Len]
     """
-    # 累积求和得到位置编码
     position_ids = attention_mask.long().cumsum(dim=-1) - 1
     position_ids.masked_fill_(attention_mask == 0, 0)
     return position_ids
-
-

@@ -510,7 +510,8 @@ class RayPPOTrainer:
         self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
-        reward_model_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
+        # [SPD Fix] 移除 extra_info，让它传给 rollout 阶段，rollout 可以修改后通过 union 返回给 reward 阶段
+        reward_model_keys = set({"data_source", "reward_model", "uid"}) & batch.non_tensor_batch.keys()
 
         # pop those keys for generation
         batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
@@ -1019,6 +1020,9 @@ class RayPPOTrainer:
                     )
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
+                # [DEBUG] 打印原始 Batch Size
+                print(f"[DEBUG RayTrainer] Original batch size from dataloader: {batch.batch.batch_size[0]}")
+
                 # add uid to batch
                 batch.non_tensor_batch["uid"] = np.array(
                     [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
@@ -1089,6 +1093,9 @@ class RayPPOTrainer:
                     batch.meta_info["global_token_num"] = torch.sum(batch.batch["attention_mask"], dim=-1).tolist()
 
                     with marked_timer("reward", timing_raw, color="yellow"):
+                        # [DEBUG] 打印输入 Reward Function 的 Batch Size
+                        print(f"[DEBUG RayTrainer] Batch size input to reward function: {batch.batch.batch_size[0]}")
+                        
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
                             reward_tensor = self.rm_wg.compute_rm_score(batch)

@@ -108,25 +108,11 @@ def default_compute_score(
     # =================================================================
     elif data_source == "spd_scorer":
         from . import spd_scorer_reward
-
-        # 从 extra_info 中提取 SPD 特定参数
-        spd_params = extra_info if extra_info else {}
+        
         res = spd_scorer_reward.compute_score(
             solution_str=solution_str,
             ground_truth=ground_truth,
-            draft_tokens=spd_params.get("draft_tokens"),
-            target_tokens=spd_params.get("target_tokens"),
-            is_correct_baseline=spd_params.get("is_correct_baseline", False),
-            draft_len=spd_params.get("draft_len", 0),
-            alpha=spd_params.get("alpha", 1.0),
-            penalty_break=spd_params.get("penalty_break", -10.0),
-            reward_correct=spd_params.get("reward_correct", 100.0),
-            reward_useless=spd_params.get("reward_useless", 0.0),
-            # 上下文和补全服务配置
-            context_text=spd_params.get("context_text"),
-            target_model_url=spd_params.get("target_model_url"),
-            target_model_name=spd_params.get("target_model_name"),
-            model_path=spd_params.get("model_path"),
+            extra_info=extra_info,
         )
 
     else:
